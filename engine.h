@@ -4,6 +4,7 @@
 #include "board.h"
 #include "movegenerator.h"
 #include "ZobristHashing.h"
+#include <atomic>
 #include <thread>
 #include <vector>
 #include "syzygy.h"
@@ -20,6 +21,9 @@ public:
     MoveGenerator* moveGenerator;
     Engine();
     ~Engine(); 
+    long long nodesSearched() const;
+    long long leafNodesSearched() const;
+    void resetSearchStats();
 private:
     int evaluate(board &b);
     static const int MAX_DEPTH = 64;

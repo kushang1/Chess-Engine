@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 
+#include "profiler.h"
 #include "ZobristHashing.h"
 
 namespace {
@@ -43,6 +44,7 @@ void board::clearBoard() {
 }
 
 void board::addPiece(Piece p, int sq) {
+    Profiler::ScopedTimer timer(Profiler::HashState);
     if (p == EMPTY || sq < 0 || sq >= 64) {
         return;
     }
@@ -73,6 +75,7 @@ void board::addPiece(Piece p, int sq) {
 }
 
 void board::removePiece(Piece p, int sq) {
+    Profiler::ScopedTimer timer(Profiler::HashState);
     if (p == EMPTY || sq < 0 || sq >= 64) {
         return;
     }
@@ -111,6 +114,7 @@ void board::removePiece(Piece p, int sq) {
 }
 
 void board::movePiece(Piece p, int from, int to) {
+    Profiler::ScopedTimer timer(Profiler::HashState);
     if (p == EMPTY || from == to) {
         return;
     }
@@ -280,6 +284,7 @@ void board::rebuildPieceLists() {
 }
 
 Unmove board::makeMove(const Move& m) {
+    Profiler::ScopedTimer timer(Profiler::MakeMove);
     Unmove u;
     u.fromPiece = m.moved;
     u.toPiece = m.wasEnPassant ? EMPTY : m.captured;
@@ -374,6 +379,7 @@ Unmove board::makeMove(const Move& m) {
 }
 
 void board::unmakeMove(const Move& m, const Unmove& u) {
+    Profiler::ScopedTimer timer(Profiler::UndoMove);
     Piece moving = u.fromPiece;
 
     isWhiteTurn = u.prevTurn;

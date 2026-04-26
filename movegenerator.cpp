@@ -2,6 +2,8 @@
 
 #include <array>
 
+#include "profiler.h"
+
 namespace {
 
 constexpr Bitboard FULL_MASK = ~0ULL;
@@ -86,6 +88,7 @@ inline int updatedCastleRights(int currentRights, Piece moved, int from, Piece c
 }
 
 inline Bitboard attackersTo(const board& b, int sq, bool byWhite, Bitboard occ) {
+    Profiler::ScopedTimer timer(Profiler::LegalityChecking);
     if (sq < 0 || sq >= 64) {
         return 0;
     }
@@ -101,8 +104,7 @@ inline Bitboard attackersTo(const board& b, int sq, bool byWhite, Bitboard occ) 
 }
 
 void computePins(const board& b, GenerationContext& ctx) {
-    ctx.pinMasks.fill(FULL_MASK);
-
+    Profiler::ScopedTimer timer(Profiler::LegalityChecking);
     Bitboard enemyOrthogonal = rookQueens(b, !ctx.whiteToMove);
     Bitboard enemyDiagonal = bishopQueens(b, !ctx.whiteToMove);
 
@@ -159,7 +161,6 @@ GenerationContext buildContext(const board& b, bool legalOnly) {
     ctx.usOcc = b.occupancy(ctx.whiteToMove);
     ctx.themOcc = b.occupancy(!ctx.whiteToMove);
     ctx.occ = b.occupied;
-    ctx.pinMasks.fill(FULL_MASK);
 
     if (!legalOnly || ctx.kingSq == -1) {
         return ctx;
@@ -254,7 +255,7 @@ void generatePawnMoves(board& b, MoveList& moves, const GenerationContext& ctx, 
     while (pawns) {
         int from = Bitboards::poplsb(pawns);
         Bitboard fromMask = Bitboards::bit(from);
-        Bitboard pinMask = legalOnly ? ctx.pinMasks[from] : FULL_MASK;
+        Bitboard pinMask = (legalOnly && ((ctx.pinned & fromMask) != 0)) ? ctx.pinMasks[from] : FULL_MASK;
         int row = from >> 3;
 
         int oneStep = ctx.whiteToMove ? (from - 8) : (from + 8);
@@ -335,10 +336,13 @@ void generateSlidingMoves(const board& b, MoveList& moves, const GenerationConte
 
     while (pieces) {
         int from = Bitboards::poplsb(pieces);
+        Bitboard fromMask = Bitboards::bit(from);
         Bitboard targets = AttackFn(from, ctx.occ) & ~ctx.usOcc;
         if (legalOnly) {
             targets &= ctx.checkMask;
-            targets &= ctx.pinMasks[from];
+            if ((ctx.pinned & fromMask) != 0) {
+                targets &= ctx.pinMasks[from];
+            }
         }
 
         while (targets) {
@@ -408,7 +412,217 @@ void generateCastles(const board& b, MoveList& moves, const GenerationContext& c
     }
 }
 
+int countEnPassant(board& b, const GenerationContext& ctx, int from, bool legalOnly) {
+    if (!b.hasEnPassant || b.enPassantSquare < 0) {
+        return 0;
+    }
+
+    int epSq = b.enPassantSquare;
+    if ((Bitboards::PawnAttacks[ctx.whiteToMove ? Bitboards::WHITE : Bitboards::BLACK][from]
+        & Bitboards::bit(epSq)) == 0) {
+        return 0;
+    }
+
+    if (legalOnly && ctx.checkerCount > 1) {
+        return 0;
+    }
+
+    if (!legalOnly) {
+        return 1;
+    }
+
+    Move epMove(from, epSq, pawnPiece(ctx.whiteToMove), pawnPiece(!ctx.whiteToMove), b.castleRights);
+    epMove.wasEnPassant = true;
+
+    Unmove undo = b.makeMove(epMove);
+    int kingSq = b.kingSquare(ctx.whiteToMove);
+    int legal = (kingSq != -1 && attackersTo(b, kingSq, !ctx.whiteToMove, b.occupied) == 0) ? 1 : 0;
+    b.unmakeMove(epMove, undo);
+    return legal;
+}
+
+int countPawnMoves(board& b, const GenerationContext& ctx, bool legalOnly) {
+    int count = 0;
+    Bitboard pawns = b.pieces(pawnPiece(ctx.whiteToMove));
+    Bitboard enemyKing = b.pieces(kingPiece(!ctx.whiteToMove));
+
+    while (pawns) {
+        int from = Bitboards::poplsb(pawns);
+        Bitboard fromMask = Bitboards::bit(from);
+        Bitboard pinMask = (legalOnly && ((ctx.pinned & fromMask) != 0)) ? ctx.pinMasks[from] : FULL_MASK;
+        int row = from >> 3;
+
+        int oneStep = ctx.whiteToMove ? (from - 8) : (from + 8);
+        if (oneStep >= 0 && oneStep < 64) {
+            Bitboard oneMask = Bitboards::bit(oneStep);
+            if ((ctx.occ & oneMask) == 0) {
+                bool promotion = ctx.whiteToMove ? (row == 1) : (row == 6);
+                if ((!legalOnly || ((pinMask & oneMask) != 0 && (ctx.checkMask & oneMask) != 0))) {
+                    count += promotion ? 4 : 1;
+                }
+
+                bool startRank = ctx.whiteToMove ? (row == 6) : (row == 1);
+                if (startRank) {
+                    int twoStep = ctx.whiteToMove ? (from - 16) : (from + 16);
+                    Bitboard twoMask = Bitboards::bit(twoStep);
+                    if ((ctx.occ & twoMask) == 0 &&
+                        (!legalOnly || ((pinMask & twoMask) != 0 && (ctx.checkMask & twoMask) != 0))) {
+                        ++count;
+                    }
+                }
+            }
+        }
+
+        Bitboard captures = Bitboards::PawnAttacks[ctx.whiteToMove ? Bitboards::WHITE : Bitboards::BLACK][from]
+            & ctx.themOcc & ~enemyKing;
+        if (legalOnly) {
+            captures &= ctx.checkMask;
+            captures &= pinMask;
+        }
+
+        bool capturePromotion = ctx.whiteToMove ? (row == 1) : (row == 6);
+        count += Bitboards::popcount(captures) * (capturePromotion ? 4 : 1);
+        count += countEnPassant(b, ctx, from, legalOnly);
+    }
+
+    return count;
+}
+
+int countKnightMoves(const board& b, const GenerationContext& ctx, bool legalOnly) {
+    Bitboard knights = b.pieces(knightPiece(ctx.whiteToMove));
+    Bitboard enemyKing = b.pieces(kingPiece(!ctx.whiteToMove));
+    if (legalOnly) {
+        knights &= ~ctx.pinned;
+    }
+
+    int count = 0;
+    while (knights) {
+        int from = Bitboards::poplsb(knights);
+        Bitboard targets = Bitboards::KnightAttacks[from] & ~ctx.usOcc & ~enemyKing;
+        if (legalOnly) {
+            targets &= ctx.checkMask;
+        }
+        count += Bitboards::popcount(targets);
+    }
+    return count;
+}
+
+template <Bitboard(*AttackFn)(int, Bitboard)>
+int countSlidingMoves(const board& b, const GenerationContext& ctx, bool legalOnly, Piece piece) {
+    Bitboard pieces = b.pieces(piece);
+    Bitboard enemyKing = b.pieces(kingPiece(!ctx.whiteToMove));
+    int count = 0;
+
+    while (pieces) {
+        int from = Bitboards::poplsb(pieces);
+        Bitboard fromMask = Bitboards::bit(from);
+        Bitboard targets = AttackFn(from, ctx.occ) & ~ctx.usOcc & ~enemyKing;
+        if (legalOnly) {
+            targets &= ctx.checkMask;
+            if ((ctx.pinned & fromMask) != 0) {
+                targets &= ctx.pinMasks[from];
+            }
+        }
+        count += Bitboards::popcount(targets);
+    }
+
+    return count;
+}
+
+int countKingMoves(const board& b, const GenerationContext& ctx, bool legalOnly) {
+    Bitboard targets = Bitboards::KingAttacks[ctx.kingSq]
+        & ~ctx.usOcc
+        & ~b.pieces(kingPiece(!ctx.whiteToMove));
+    int count = 0;
+
+    while (targets) {
+        int to = Bitboards::poplsb(targets);
+        if (!legalOnly || kingMoveLeavesSafe(b, ctx, to)) {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+int countCastles(const board& b, const GenerationContext& ctx, bool legalOnly) {
+    if (ctx.kingSq == -1 || (legalOnly && ctx.checkerCount != 0)) {
+        return 0;
+    }
+
+    auto safeSquare = [&](int sq) {
+        return !legalOnly || attackersTo(b, sq, !ctx.whiteToMove, ctx.occ) == 0;
+    };
+
+    int count = 0;
+    if (ctx.whiteToMove && ctx.kingSq == 60) {
+        if ((b.castleRights & 0b0001) != 0 &&
+            b.pieceAt(63) == WR &&
+            (b.occupied & (Bitboards::bit(61) | Bitboards::bit(62))) == 0 &&
+            safeSquare(60) && safeSquare(61) && safeSquare(62)) {
+            ++count;
+        }
+
+        if ((b.castleRights & 0b0010) != 0 &&
+            b.pieceAt(56) == WR &&
+            (b.occupied & (Bitboards::bit(57) | Bitboards::bit(58) | Bitboards::bit(59))) == 0 &&
+            safeSquare(60) && safeSquare(59) && safeSquare(58)) {
+            ++count;
+        }
+    }
+    else if (!ctx.whiteToMove && ctx.kingSq == 4) {
+        if ((b.castleRights & 0b0100) != 0 &&
+            b.pieceAt(7) == BR &&
+            (b.occupied & (Bitboards::bit(5) | Bitboards::bit(6))) == 0 &&
+            safeSquare(4) && safeSquare(5) && safeSquare(6)) {
+            ++count;
+        }
+
+        if ((b.castleRights & 0b1000) != 0 &&
+            b.pieceAt(0) == BR &&
+            (b.occupied & (Bitboards::bit(1) | Bitboards::bit(2) | Bitboards::bit(3))) == 0 &&
+            safeSquare(4) && safeSquare(3) && safeSquare(2)) {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+int countMoves(board& b, bool legalOnly) {
+    Profiler::ScopedTimer timer(Profiler::MoveGeneration);
+
+    GenerationContext ctx = buildContext(b, legalOnly);
+    if (ctx.kingSq == -1) {
+        return 0;
+    }
+
+    int count = countKingMoves(b, ctx, legalOnly);
+    if (legalOnly && ctx.checkerCount > 1) {
+        return count;
+    }
+
+    if (legalOnly && ctx.checkerCount == 0 && ctx.pinned == 0 && !b.hasEnPassant) {
+        count += countCastles(b, ctx, true);
+        count += countPawnMoves(b, ctx, false);
+        count += countKnightMoves(b, ctx, false);
+        count += countSlidingMoves<Bitboards::bishopAttacks>(b, ctx, false, bishopPiece(ctx.whiteToMove));
+        count += countSlidingMoves<Bitboards::rookAttacks>(b, ctx, false, rookPiece(ctx.whiteToMove));
+        count += countSlidingMoves<Bitboards::queenAttacks>(b, ctx, false, queenPiece(ctx.whiteToMove));
+        return count;
+    }
+
+    count += countCastles(b, ctx, legalOnly);
+    count += countPawnMoves(b, ctx, legalOnly);
+    count += countKnightMoves(b, ctx, legalOnly);
+    count += countSlidingMoves<Bitboards::bishopAttacks>(b, ctx, legalOnly, bishopPiece(ctx.whiteToMove));
+    count += countSlidingMoves<Bitboards::rookAttacks>(b, ctx, legalOnly, rookPiece(ctx.whiteToMove));
+    count += countSlidingMoves<Bitboards::queenAttacks>(b, ctx, legalOnly, queenPiece(ctx.whiteToMove));
+    return count;
+}
+
 void generateMoves(board& b, MoveList& moves, bool legalOnly) {
+    Profiler::ScopedTimer timer(Profiler::MoveGeneration);
     moves.clear();
 
     GenerationContext ctx = buildContext(b, legalOnly);
@@ -464,6 +678,10 @@ void MoveGenerator::generatePseudoLegalMoves(board& Board, MoveList& moves) {
 
 void MoveGenerator::generateLegalMoves(board& Board, MoveList& moves) {
     generateMoves(Board, moves, true);
+}
+
+int MoveGenerator::countLegalMoves(board& Board) {
+    return countMoves(Board, true);
 }
 
 bool MoveGenerator::isSquareAttacked(const board& Board, int sq, bool byWhite) {

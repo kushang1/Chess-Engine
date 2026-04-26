@@ -617,20 +617,26 @@ long long MainWindow::perft(int depth, board& b) {
         return 1;
     }
 
+    if (depth == 1) {
+        return moveGenerator.countLegalMoves(b);
+    }
+
     long long nodes = 0;
     MoveList moves;
     moveGenerator.generateLegalMoves(b, moves);
 
+    if (depth == 2) {
+        for (Move& m : moves) {
+            Unmove u = b.makeMove(m);
+            nodes += moveGenerator.countLegalMoves(b);
+            b.unmakeMove(m, u);
+        }
+        return nodes;
+    }
+
     for (Move& m : moves) {
         Unmove u = b.makeMove(m);
-
-        if (depth == 1) {
-            ++nodes;
-        }
-        else {
-            nodes += perft(depth - 1, b);
-        }
-
+        nodes += perft(depth - 1, b);
         b.unmakeMove(m, u); 
     }
 

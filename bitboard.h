@@ -6,6 +6,8 @@
 #include <intrin.h>
 #include <vector>
 
+#include "profiler.h"
+
 using Bitboard = uint64_t;
 
 namespace Bitboards {
@@ -152,12 +154,14 @@ inline Bitboard occupancyFromIndex(int index, Bitboard mask) {
 }
 
 inline Bitboard rookAttacks(int sq, Bitboard occ) {
+    Profiler::ScopedTimer timer(Profiler::SlidingAttack);
     Bitboard mask = RookMasks[sq];
     uint64_t index = pext64(occ, mask);
     return RookAttackTable[RookOffsets[sq] + index];
 }
 
 inline Bitboard bishopAttacks(int sq, Bitboard occ) {
+    Profiler::ScopedTimer timer(Profiler::SlidingAttack);
     Bitboard mask = BishopMasks[sq];
     uint64_t index = pext64(occ, mask);
     return BishopAttackTable[BishopOffsets[sq] + index];

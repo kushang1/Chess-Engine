@@ -45,6 +45,22 @@ Engine::~Engine() {
 	delete[] tt;
 }
 
+void Engine::resetSearchStats()
+{
+	totalNodes.store(0, std::memory_order_relaxed);
+	leafNodes.store(0, std::memory_order_relaxed);
+}
+
+long long Engine::nodesSearched() const
+{
+	return totalNodes.load(std::memory_order_relaxed);
+}
+
+long long Engine::leafNodesSearched() const
+{
+	return leafNodes.load(std::memory_order_relaxed);
+}
+
 static const int pieceValueSimple[13] = {
 	0, 9, 5, 1, 3, 100, 3,
 	   9, 5, 1, 3, 100, 3
@@ -429,11 +445,28 @@ struct RootSearchResult {
 	int score;
 };
 
+static void selectBestScoredMove(Move* moves, int* scores, int index, int count)
+{
+	int best = index;
+	for (int i = index + 1; i < count; ++i) {
+		if (scores[i] > scores[best]) {
+			best = i;
+		}
+	}
+
+	if (best != index) {
+		std::swap(scores[index], scores[best]);
+		std::swap(moves[index], moves[best]);
+	}
+}
+
 
 
 Move Engine::findBestMove(board& b, int maxDepth,
 	const std::vector<uint64_t>& globalReps)
 {
+	resetSearchStats();
+
 	Move bookMove = probeBook(b);
 	if (bookMove.from != -1)
 	{
@@ -830,10 +863,11 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	// -------------------------------
 	// NORMAL MOVE GENERATION
 	// -------------------------------
-	auto moves = moveGenerator->generateLegalMoves(b);
+	MoveList moves;
+	moveGenerator->generateLegalMoves(b, moves);
 
 	// No legal moves → checkmate or stalemate
-	if (moves.empty()) {
+	if (moves.count == 0) {
 		// we already have inCheck from above
 		if (inCheck) {
 			return -(MATE_SCORE - (maxDepth - depth));
@@ -844,24 +878,19 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	}
 
 	// Score and order moves
-	std::vector<std::pair<int, Move>> scored;
-	scored.reserve(moves.size());
+	int scores[MoveList::MAX_MOVES];
+	Move* moveData = moves.data();
 
-	for (auto& m : moves)
+	for (int i = 0; i < moves.count; ++i)
 	{
+		Move& m = moveData[i];
 		int s = scoreMove(m, b, depth);
 
 		if (haveTTMove && m.from == ttMove.from && m.to == ttMove.to)
 			s += 200000; // big bonus for TT move
 
-		scored.push_back({ s, m });
+		scores[i] = s;
 	}
-
-	std::sort(scored.begin(), scored.end(),
-		[](auto& a, auto& b) { return a.first > b.first; });
-
-	moves.clear();
-	for (auto& sm : scored) moves.push_back(sm.second);
 
 	int besteval = -INF;
 	Move bestMoveLocal;
@@ -871,7 +900,9 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	// -------------------------------
 	int moveIndex = 0;
 
-	for (auto& move : moves) {
+	for (int orderedIndex = 0; orderedIndex < moves.count; ++orderedIndex) {
+		selectBestScoredMove(moveData, scores, orderedIndex, moves.count);
+		Move& move = moveData[orderedIndex];
 
 		Unmove u = b.makeMove(move);
 
@@ -1054,27 +1085,29 @@ int Engine::quiescence(board& b, int alpha, int beta)
 		alpha = standPat;
 
 	// Generate all legal moves, then filter captures
-	auto moves = moveGenerator->generateLegalMoves(b);
+	MoveList moves;
+	moveGenerator->generateLegalMoves(b, moves);
 
 	// Score only captures using MVV-LVA (depth 0 so killers/history are harmless)
-	std::vector<std::pair<int, Move>> scored;
-	scored.reserve(moves.size());
+	int scores[MoveList::MAX_MOVES];
+	Move* moveData = moves.data();
+	int captureCount = 0;
 
 	for (auto& m : moves) {
 		if (m.captured == EMPTY) continue; // only captures in quiescence
-		scored.push_back({ scoreMove(m, b, 0), m });
+		moveData[captureCount] = m;
+		scores[captureCount] = scoreMove(m, b, 0);
+		++captureCount;
 	}
 
-	if (scored.empty()) {
+	if (captureCount == 0) {
 		// No captures → position is quiet, return stand-pat eval
 		return alpha;
 	}
 
-	std::sort(scored.begin(), scored.end(),
-		[](auto& a, auto& b) { return a.first > b.first; });
-
-	for (auto& sm : scored) {
-		const Move& m = sm.second;
+	for (int orderedIndex = 0; orderedIndex < captureCount; ++orderedIndex) {
+		selectBestScoredMove(moveData, scores, orderedIndex, captureCount);
+		const Move& m = moveData[orderedIndex];
 
 		Unmove u = b.makeMove(m);
 		int score = -quiescence(b, -beta, -alpha);
