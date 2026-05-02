@@ -1,8 +1,8 @@
-/Book
-/syzygy
+
 x64/
 Chess/x64/
 .vs/
+/tests
 /Chess.exe
 *.obj
 *.pdb
@@ -11,7 +11,6 @@ Chess/x64/
 *.tlog
 *.iobj
 *.ipdb
-*.exp
 perft_result.txt
 profile_result.txt
 search_bench_result.txt
