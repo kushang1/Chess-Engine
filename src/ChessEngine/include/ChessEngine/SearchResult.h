@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "Move.h"
 
@@ -16,6 +17,24 @@ struct SearchResult {
 struct PerftResult {
     long long nodes = 0;
     int elapsedMs = 0;
+};
+
+struct PerftDivideEntry {
+    Move move;
+    long long nodes = 0;
+};
+
+enum class GameStatusKind {
+    Ongoing,
+    Checkmate,
+    Stalemate,
+    FiftyMoveRule
+};
+
+struct GameStatus {
+    GameStatusKind kind = GameStatusKind::Ongoing;
+    bool whiteToMove = true;
+    bool inCheck = false;
 };
 
 } // namespace chess

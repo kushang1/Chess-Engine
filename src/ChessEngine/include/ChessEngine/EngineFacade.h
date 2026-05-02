@@ -1,6 +1,6 @@
 ﻿#pragma once
 
-#include <memory>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -22,21 +22,34 @@ public:
     void newGame();
     bool setPositionFromFen(const std::string& fen);
 
+    Piece pieceAt(int square) const;
+    bool isWhiteTurn() const;
+    uint64_t positionHash() const;
+    std::string positionKey() const;
+
     std::vector<Move> legalMoves() const;
 
     bool makeMove(const Move& move);
     bool makeMoveUci(const std::string& uciMove);
 
     SearchResult findBestMove(const SearchLimits& limits);
+    SearchResult findBestMove(const SearchLimits& limits, const std::vector<uint64_t>& repetitionHistory);
+    void setHashSizeMb(int megabytes);
+    void clearSearchStop();
+    void stopSearch();
 
     PerftResult perft(int depth);
+    std::vector<PerftDivideEntry> divide(int depth);
 
     std::string currentFen() const;
+    std::string moveToUci(const Move& move) const;
+    std::string moveToSan(const Move& move) const;
+    GameStatus gameStatus() const;
     bool isGameOver() const;
 
 private:
     class Impl;
-    std::unique_ptr<Impl> impl;
+    Impl* impl = nullptr;
 };
 
 } // namespace chess

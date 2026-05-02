@@ -4,6 +4,8 @@
 #include "Engine.h"
 
 #include <algorithm>
+#include <cstring>
+#include <new>
 #include <random>
 
 
@@ -16,6 +18,44 @@ static const int MATE_THRESHOLD = MATE_SCORE - 10000;
 
 static const int INF = 2000000000;
 
+namespace {
+
+constexpr int DefaultHashMb = 128;
+constexpr int MinHashMb = 1;
+constexpr int MaxHashMb = 4096;
+
+uint64_t floorPowerOfTwo(uint64_t value)
+{
+	if (value == 0) {
+		return 0;
+	}
+
+	uint64_t out = 1;
+	while (out <= value / 2) {
+		out <<= 1;
+	}
+	return out;
+}
+
+class RepetitionFrame {
+public:
+	RepetitionFrame(std::vector<uint64_t>& history, uint64_t key)
+		: history(history)
+	{
+		history.push_back(key);
+	}
+
+	~RepetitionFrame()
+	{
+		history.pop_back();
+	}
+
+private:
+	std::vector<uint64_t>& history;
+};
+
+} // namespace
+
 
 Engine::Engine() : stopSearch(false) {
 	for (int i = 0; i < 2; i++)
@@ -24,11 +64,7 @@ Engine::Engine() : stopSearch(false) {
 
 	memset(historyHeuristic, 0, sizeof(historyHeuristic));
 
-	const uint64_t TT_BITS = 24;
-	ttSize = (1ULL << TT_BITS);
-	ttMask = ttSize - 1;
-
-	tt = new TTEntry[ttSize];  // all fields default initialized
+	resizeTranspositionTable(DefaultHashMb);
 
 }
 
@@ -46,6 +82,42 @@ void Engine::resetSearchStats()
 void Engine::setTimeLimitMs(int milliseconds)
 {
 	timeLimitMs = std::max(1, milliseconds);
+}
+
+void Engine::setHashSizeMb(int megabytes)
+{
+	resizeTranspositionTable(megabytes);
+}
+
+void Engine::resizeTranspositionTable(int megabytes)
+{
+	megabytes = std::clamp(megabytes, MinHashMb, MaxHashMb);
+
+	const uint64_t bytes = static_cast<uint64_t>(megabytes) * 1024ULL * 1024ULL;
+	uint64_t entries = floorPowerOfTwo(bytes / sizeof(TTEntry));
+	if (entries == 0) {
+		entries = 1;
+	}
+
+	TTEntry* newTable = new (std::nothrow) TTEntry[entries]();
+	if (newTable == nullptr) {
+		return;
+	}
+
+	delete[] tt;
+	tt = newTable;
+	ttSize = entries;
+	ttMask = entries - 1;
+}
+
+void Engine::clearStop()
+{
+	stopSearch.store(false, std::memory_order_relaxed);
+}
+
+void Engine::requestStop()
+{
+	stopSearch.store(true, std::memory_order_relaxed);
 }
 
 long long Engine::nodesSearched() const
@@ -177,6 +249,8 @@ static const int kingPST[64] =
 // ==========================================================
 int Engine::scoreMove(const Move& m, const board& b, int depth)
 {
+	depth = std::clamp(depth, 0, MAX_DEPTH - 1);
+
 	// 1. MVV-LVA captures
 	if (m.captured != EMPTY) {
 		int victim = pieceValueSimple[m.captured];
@@ -463,6 +537,8 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	const std::vector<uint64_t>& globalReps)
 {
 	resetSearchStats();
+	maxDepth = std::clamp(maxDepth, 1, MAX_DEPTH - 1);
+	this->maxDepth = maxDepth;
 
 	Move bookMove = probeBook(b);
 	if (bookMove.from != -1)
@@ -473,22 +549,16 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	// --------------------------------------------
 	// 5 second search time
 	// --------------------------------------------
-	stopSearch.store(false, std::memory_order_relaxed);
 	searchStart = std::chrono::steady_clock::now();
 
 	// --------------------------------------------
 	// Build repetition history
 	// --------------------------------------------
-	uint64_t repHistory[256];
-	int repLen = 0;
-
-
-
-	for (int i = 0; i < globalReps.size(); ++i)
-	{
-		repHistory[repLen++] = globalReps[i];
+	std::vector<uint64_t> repHistory = globalReps;
+	const uint64_t currentKey = computeHash(b);
+	if (repHistory.empty() || repHistory.back() != currentKey) {
+		repHistory.push_back(currentKey);
 	}
-	repHistory[repLen++] = computeHash(b);
 
 	// --------------------------------------------
 	// Root move generation
@@ -538,45 +608,31 @@ Move Engine::findBestMove(board& b, int maxDepth,
 		struct RootSearchResult { Move move; int score; bool full; };
 		std::vector<RootSearchResult> results(rootMoves.size());
 
-		std::vector<std::thread> threads;
-		threads.reserve(rootMoves.size());
-
-		const int baseLen = repLen;
-
-		stopSearch.store(false, std::memory_order_relaxed);
-
 		// --------------------------------------------
-		// Start search for each root move in a thread
+		// Search root moves serially for tournament stability.
 		// --------------------------------------------
 		for (size_t i = 0; i < rootMoves.size(); i++)
 		{
+			if (stopSearch.load(std::memory_order_relaxed)) {
+				results[i] = { rootMoves[i], -INF, false };
+				continue;
+			}
+
 			Move rm = rootMoves[i];
+			board local = b;
+			std::vector<uint64_t> localRepHistory = repHistory;
 
-			threads.emplace_back(
-				[this, &b, rm, depth, &results, i,
-				repHistoryInitial = repHistory, baseLen]()
-				{
-					board local = b;
+			Unmove u = local.makeMove(rm);
+			(void)u;
 
-					uint64_t rep[256];
-					memcpy(rep, repHistoryInitial, baseLen * sizeof(uint64_t));
-					int repN = baseLen;
+			bool fullEval = true;
+			int score = -search(local, depth - 1, -INF, INF, localRepHistory);
 
-					Unmove u = local.makeMove(rm);
+			if (stopSearch.load(std::memory_order_relaxed))
+				fullEval = false;
 
-					bool fullEval = true;
-					int score = -search(local, depth - 1, -INF, INF, rep, repN);
-
-					if (stopSearch.load(std::memory_order_relaxed))
-						fullEval = false;
-
-					results[i] = { rm, score, fullEval };
-				}
-			);
+			results[i] = { rm, score, fullEval };
 		}
-
-		for (auto& t : threads)
-			if (t.joinable()) t.join();
 
 		now = std::chrono::steady_clock::now();
 		elapsed =
@@ -647,8 +703,9 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 
 int Engine::search(board& b, int depth, int alpha, int beta,
-	uint64_t* repHistory, int repLen)
+	std::vector<uint64_t>& repHistory)
 {
+	depth = std::clamp(depth, 0, MAX_DEPTH - 1);
 	totalNodes++;
 	auto fix_mate_score = [&](int s, int ply) {
 		if (s > MATE_THRESHOLD)     return s - ply;
@@ -659,7 +716,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	// --------------------------------------------------
 	// Time control: periodically check if time is up
 	// --------------------------------------------------
-	if ((totalNodes & 0x3FFF) == 0) { // check every ~16K nodes
+	if ((totalNodes & 0x0FFF) == 0) { // check every ~4K nodes
 		if (!stopSearch.load(std::memory_order_relaxed)) {
 			auto now = std::chrono::steady_clock::now();
 			auto elapsedMs =
@@ -689,14 +746,13 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	uint64_t key = computeHash(b);
 
 	// check only same-side-to-move positions
-	for (int i = repLen - 1; i >= 0; --i) {
-		if (repHistory[i] == key) {
+	for (auto it = repHistory.rbegin(); it != repHistory.rend(); ++it) {
+		if (*it == key) {
 			return 0;   // repetition ? draw score
 		}
 	}
 
-	
-	repHistory[repLen++] = key;
+	RepetitionFrame repetitionFrame(repHistory, key);
 	
 
 	// Leaf ? quiescence search
@@ -827,7 +883,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			const int R = 2; // depth reduction
 			int score = -search(b, depth - 1 - R,
 				-beta, -beta + 1,
-				repHistory, repLen);
+				repHistory);
 
 			// Undo null move
 			b.isWhiteTurn = prevTurn;
@@ -955,7 +1011,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			// Reduced-depth search with null window
 			eval = -search(b, newDepth - R,
 				-alpha - 1, -alpha,
-				repHistory, repLen);
+				repHistory);
 
 			eval = fix_mate_score(eval, 1);
 
@@ -963,7 +1019,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			if (eval > alpha) {
 				eval = -search(b, newDepth,
 					-beta, -alpha,
-					repHistory, repLen);
+					repHistory);
 
 				eval = fix_mate_score(eval, 1);
 			}
@@ -972,7 +1028,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			// Normal full-depth search (with check extension applied)
 			eval = -search(b, newDepth,
 				-beta, -alpha,
-				repHistory, repLen);
+				repHistory);
 
 			eval = fix_mate_score(eval, 1);
 		}
@@ -1040,7 +1096,7 @@ int Engine::quiescence(board& b, int alpha, int beta)
 		};
 
 
-	if ((totalNodes & 0x3FFF) == 0) {
+	if ((totalNodes & 0x0FFF) == 0) {
 		if (!stopSearch.load(std::memory_order_relaxed)) {
 			auto now = std::chrono::steady_clock::now();
 			auto elapsedMs =

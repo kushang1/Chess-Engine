@@ -695,7 +695,7 @@ static bool test_tb(const char *str, const char *suffix)
     close_tb(fd);
     if ((size & 63) != 16) {
       fprintf(stderr, "Incomplete tablebase file %s.%s\n", str, suffix);
-      printf("info string Incomplete tablebase file %s.%s\n", str, suffix);
+      fprintf(stderr, "info string Incomplete tablebase file %s.%s\n", str, suffix);
       fd = FD_ERR;
     }
   }
@@ -1019,7 +1019,7 @@ bool tb_init(const char *path)
 
 finished:
   /* TBD - assumes UCI
-  printf("info string Found %d WDL, %d DTM and %d DTZ tablebase files.\n",
+  fprintf(stderr, "info string Found %d WDL, %d DTM and %d DTZ tablebase files.\n",
       numWdl, numDtm, numDtz);
   fflush(stdout);
   */
@@ -1663,7 +1663,7 @@ static uint8_t *decompress_pairs(struct PairsData *d, size_t idx)
   int litIdx = (idx & (((size_t)1 << d->idxBits) - 1)) - ((size_t)1 << (d->idxBits - 1));
   uint32_t block;
   /*if (d->indexTable == NULL) {
-      printf("indexTable NULL! path invalid or table corrupted.\n");
+      fprintf(stderr, "indexTable NULL! path invalid or table corrupted.\n");
       abort();
   }*/
   memcpy(&block, d->indexTable + 6 * mainIdx, sizeof(block));
@@ -2500,7 +2500,7 @@ void tb_expand_mate(Pos *pos, struct TbRootMove *move, Value moveScore, unsigned
   }
 
   // Now try to expand until the actual mate.
-  if (popcount(pos->white | pos->black) <= cardinalityDTM) {
+  if (static_cast<unsigned>(popcount(pos->white | pos->black)) <= cardinalityDTM) {
     while (v != -TB_VALUE_MATE && move->pvSize < TB_MAX_PLY) {
       v = v > 0 ? -v - 1 : -v + 1;
       wdl = -wdl;

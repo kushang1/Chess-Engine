@@ -26,6 +26,9 @@ public:
     long long leafNodesSearched() const;
     void resetSearchStats();
     void setTimeLimitMs(int milliseconds);
+    void setHashSizeMb(int megabytes);
+    void clearStop();
+    void requestStop();
 private:
     int evaluate(board &b);
     static const int MAX_DEPTH = 64;
@@ -35,7 +38,7 @@ private:
 
 
     int search(board& b, int depth, int alpha, int beta,
-        uint64_t* repHistory, int repLen);
+        std::vector<uint64_t>& repHistory);
 
     int scoreMove(const Move& m, const board& b, int depth);
 
@@ -66,6 +69,8 @@ private:
     TTEntry* tt = nullptr;
     uint64_t ttSize = 0;
     uint64_t ttMask = 0;
+
+    void resizeTranspositionTable(int megabytes);
 
     std::atomic<bool> stopSearch;
     std::chrono::steady_clock::time_point searchStart;

@@ -84,6 +84,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="UciLoop.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="UciLoop.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\ChessEngine\ChessEngine.vcxproj">

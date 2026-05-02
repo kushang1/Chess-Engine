@@ -1,6 +1,5 @@
 #include "EngineFacade.h"
 
-#include <algorithm>
 #include <chrono>
 #include <sstream>
 #include <stdexcept>
@@ -49,6 +48,31 @@ Piece promotionFromChar(char ch, bool white)
     case 'b': case 'B': return white ? WB : BB;
     case 'n': case 'N': return white ? WN : BN;
     default: return EMPTY;
+    }
+}
+
+bool movesMatch(const Move& lhs, const Move& rhs)
+{
+    if (lhs.from != rhs.from || lhs.to != rhs.to) {
+        return false;
+    }
+
+    if (lhs.wasPromotion != rhs.wasPromotion) {
+        return false;
+    }
+
+    return !lhs.wasPromotion || lhs.promotedTo == rhs.promotedTo;
+}
+
+char sanPieceLetter(Piece piece)
+{
+    switch (piece) {
+    case WN: case BN: return 'N';
+    case WB: case BB: return 'B';
+    case WR: case BR: return 'R';
+    case WQ: case BQ: return 'Q';
+    case WK: case BK: return 'K';
+    default: return '\0';
     }
 }
 
@@ -126,11 +150,14 @@ public:
 };
 
 ChessEngine::ChessEngine()
-    : impl(std::make_unique<Impl>())
+    : impl(new Impl())
 {
 }
 
-ChessEngine::~ChessEngine() = default;
+ChessEngine::~ChessEngine()
+{
+    delete impl;
+}
 
 void ChessEngine::newGame()
 {
@@ -148,6 +175,39 @@ bool ChessEngine::setPositionFromFen(const std::string& fen)
     }
 }
 
+Piece ChessEngine::pieceAt(int square) const
+{
+    if (square < 0 || square >= 64) {
+        return EMPTY;
+    }
+    return impl->position.pieceAt(square);
+}
+
+bool ChessEngine::isWhiteTurn() const
+{
+    return impl->position.isWhiteTurn;
+}
+
+uint64_t ChessEngine::positionHash() const
+{
+    return impl->position.hash;
+}
+
+std::string ChessEngine::positionKey() const
+{
+    std::string fen = currentFen();
+    int spaces = 0;
+    for (std::size_t i = 0; i < fen.size(); ++i) {
+        if (fen[i] == ' ') {
+            ++spaces;
+            if (spaces == 4) {
+                return fen.substr(0, i);
+            }
+        }
+    }
+    return fen;
+}
+
 std::vector<Move> ChessEngine::legalMoves() const
 {
     board copy = impl->position;
@@ -159,15 +219,7 @@ bool ChessEngine::makeMove(const Move& move)
     MoveList moves;
     impl->moveGenerator.generateLegalMoves(impl->position, moves);
     for (const Move& legal : moves) {
-        bool sameMove = legal.from == move.from &&
-            legal.to == move.to &&
-            legal.wasPromotion == move.wasPromotion;
-
-        if (sameMove && legal.wasPromotion) {
-            sameMove = legal.promotedTo == move.promotedTo;
-        }
-
-        if (sameMove) {
+        if (movesMatch(legal, move)) {
             impl->position.makeMove(legal);
             return true;
         }
@@ -212,12 +264,19 @@ bool ChessEngine::makeMoveUci(const std::string& uciMove)
 
 SearchResult ChessEngine::findBestMove(const SearchLimits& limits)
 {
+    return findBestMove(limits, std::vector<uint64_t>{ impl->position.hash });
+}
+
+SearchResult ChessEngine::findBestMove(const SearchLimits& limits, const std::vector<uint64_t>& repetitionHistory)
+{
     SearchResult result;
     impl->searcher.setTimeLimitMs(limits.moveTimeMs);
     impl->searcher.resetSearchStats();
 
-    std::vector<uint64_t> repetitions;
-    repetitions.push_back(impl->position.hash);
+    std::vector<uint64_t> repetitions = repetitionHistory;
+    if (repetitions.empty()) {
+        repetitions.push_back(impl->position.hash);
+    }
 
     auto start = std::chrono::steady_clock::now();
     result.bestMove = impl->searcher.findBestMove(impl->position, limits.maxDepth, repetitions);
@@ -230,6 +289,21 @@ SearchResult ChessEngine::findBestMove(const SearchLimits& limits)
     return result;
 }
 
+void ChessEngine::setHashSizeMb(int megabytes)
+{
+    impl->searcher.setHashSizeMb(megabytes);
+}
+
+void ChessEngine::clearSearchStop()
+{
+    impl->searcher.clearStop();
+}
+
+void ChessEngine::stopSearch()
+{
+    impl->searcher.requestStop();
+}
+
 PerftResult ChessEngine::perft(int depth)
 {
     PerftResult result;
@@ -240,6 +314,28 @@ PerftResult ChessEngine::perft(int depth)
     result.elapsedMs = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
     return result;
+}
+
+std::vector<PerftDivideEntry> ChessEngine::divide(int depth)
+{
+    std::vector<PerftDivideEntry> entries;
+    if (depth <= 0) {
+        return entries;
+    }
+
+    board copy = impl->position;
+    MoveList moves;
+    impl->moveGenerator.generateLegalMoves(copy, moves);
+    entries.reserve(moves.count);
+
+    for (Move& move : moves) {
+        Unmove undo = copy.makeMove(move);
+        long long childNodes = perftImpl(copy, impl->moveGenerator, depth - 1);
+        copy.unmakeMove(move, undo);
+        entries.push_back(PerftDivideEntry{ move, childNodes });
+    }
+
+    return entries;
 }
 
 std::string ChessEngine::currentFen() const
@@ -287,10 +383,109 @@ std::string ChessEngine::currentFen() const
     return fen.str();
 }
 
+std::string ChessEngine::moveToUci(const Move& move) const
+{
+    std::string out = squareToString(move.from) + squareToString(move.to);
+    if (move.wasPromotion) {
+        char promotion = promotionToChar(move.promotedTo);
+        if (promotion != '\0') {
+            out.push_back(promotion);
+        }
+    }
+    return out;
+}
+
+std::string ChessEngine::moveToSan(const Move& move) const
+{
+    MoveList moves;
+    impl->moveGenerator.generateLegalMoves(impl->position, moves);
+
+    const Move* legalMove = nullptr;
+    for (const Move& legal : moves) {
+        if (movesMatch(legal, move)) {
+            legalMove = &legal;
+            break;
+        }
+    }
+
+    if (legalMove == nullptr) {
+        return moveToUci(move);
+    }
+
+    board after = impl->position;
+    after.makeMove(*legalMove);
+
+    if (legalMove->wasCastling) {
+        if (impl->position.isWhiteTurn) {
+            return legalMove->to == 62 ? "O-O" : "O-O-O";
+        }
+        return legalMove->to == 6 ? "O-O" : "O-O-O";
+    }
+
+    std::string san;
+    char pieceLetter = sanPieceLetter(legalMove->moved);
+    if (pieceLetter != '\0') {
+        san.push_back(pieceLetter);
+    }
+
+    bool isCapture = legalMove->captured != EMPTY || legalMove->wasEnPassant;
+    if (pieceLetter == '\0' && isCapture) {
+        san.push_back(static_cast<char>('a' + (legalMove->from & 7)));
+        san.push_back('x');
+    }
+    else if (isCapture) {
+        san.push_back('x');
+    }
+
+    san += squareToString(legalMove->to);
+
+    if (legalMove->wasPromotion) {
+        san.push_back('=');
+        char promotion = sanPieceLetter(legalMove->promotedTo);
+        san.push_back(promotion == '\0' ? 'Q' : promotion);
+    }
+
+    MoveList replies;
+    impl->moveGenerator.generateLegalMoves(after, replies);
+    int kingSq = impl->moveGenerator.findKing(after, after.isWhiteTurn);
+    bool inCheck = kingSq != -1 &&
+        impl->moveGenerator.isSquareAttacked(after, kingSq, !after.isWhiteTurn);
+
+    if (replies.count == 0 && inCheck) {
+        san.push_back('#');
+    }
+    else if (inCheck) {
+        san.push_back('+');
+    }
+
+    return san;
+}
+
+GameStatus ChessEngine::gameStatus() const
+{
+    GameStatus status;
+    status.whiteToMove = impl->position.isWhiteTurn;
+
+    int kingSq = impl->moveGenerator.findKing(impl->position, impl->position.isWhiteTurn);
+    status.inCheck = kingSq != -1 &&
+        impl->moveGenerator.isSquareAttacked(impl->position, kingSq, !impl->position.isWhiteTurn);
+
+    if (impl->position.halfmoveClock >= 100) {
+        status.kind = GameStatusKind::FiftyMoveRule;
+        return status;
+    }
+
+    board copy = impl->position;
+    if (impl->moveGenerator.generateLegalMoves(copy).empty()) {
+        status.kind = status.inCheck ? GameStatusKind::Checkmate : GameStatusKind::Stalemate;
+    }
+
+    return status;
+}
+
 bool ChessEngine::isGameOver() const
 {
-    board copy = impl->position;
-    return impl->moveGenerator.generateLegalMoves(copy).empty();
+    return gameStatus().kind != GameStatusKind::Ongoing;
 }
 
 } // namespace chess
