@@ -22,7 +22,7 @@ uint64_t enPassantFile(int file);
 
 } // namespace ZobristData
 
-class CHESS_API ZobristHashing {
+class ZobristHashing {
 public:
     ZobristHashing();
 

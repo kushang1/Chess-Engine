@@ -1,34 +1,31 @@
-﻿#pragma once
+#pragma once
 
-#include <QtWidgets/QMainWindow>
+#include <ChessEngine/EngineFacade.h>
+
 #include "ui_MainWindow.h"
 
-#include "Board.h"
-#include "MoveGenerator.h"
-#include "Engine.h"
-
-#include <QVBoxLayout>
+#include <QFuture>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
-#include <QPushButton>
 #include <QLabel>
-#include <QShortcut>
 #include <QListWidget>
 #include <QPainter>
 #include <QPen>
-#include <chrono>
-#include <string>
+#include <QPushButton>
+#include <QShortcut>
 #include <QtConcurrent>
-#include <QFuture>
-#include <QFutureWatcher>
+#include <QtWidgets/QMainWindow>
+#include <QVBoxLayout>
 
+#include <cstdint>
+#include <string>
+#include <vector>
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
     class MainWindow;
 }
 QT_END_NAMESPACE
-
-
 
 class MainWindow : public QMainWindow
 {
@@ -44,47 +41,36 @@ private:
     void resetColors();
     void undoMove();
     void redoMove();
-    void highlightMoves(std::vector<Move>& moves);
-    std::vector<QWidget*> highlightOverlays;
+    void highlightMoves(const std::vector<Move>& moves);
     void clearHighlights();
-    bool eventFilter(QObject* obj, QEvent* event);
+    bool eventFilter(QObject* obj, QEvent* event) override;
 
     void CalculateMoves();
-    long long perft(int depth, board& b);
+    void onHistoryItemSelected(int row);
 
-    void onHistoryItemSelected(int row);   // NEW
-    // helpers
-    QString moveToString(const Move& m, const board& before) const;
-    QString squareToString(int sq) const;
-
-    inline void truncateHistory(); 
-
-    QString toSAN(const Move& m,  board& before, board& after);
-    void addMoveToHistory(const Move& m, board& before, board& after);
+    void recordCurrentPosition();
+    void restorePosition(int positionIndex);
+    void truncateHistory();
+    void addMoveToHistory(bool whiteMove, const QString& san);
     void highlightLastMove();
     bool checkDrawByRepetitionOr50();
-
-private:
+    bool updateGameStatusLabel();
 
     Ui::mainwindowClass ui;
-    QPushButton* boardButtons[8][8];  // 2D grid of buttons
-    QLabel* turnLabel = NULL;
+    QPushButton* boardButtons[8][8]{};
+    QLabel* turnLabel = nullptr;
     QListWidget* moveHistoryList = nullptr;
+    std::vector<QWidget*> highlightOverlays;
 
-
-    board gameBoard;
-    MoveGenerator moveGenerator;
-    int selectedSquare;
+    chess::ChessEngine engine;
+    int selectedSquare = -1;
     bool pieceSelected = false;
 
-    Engine engine;
-
-    std::vector<board> positionHistory;  // position after each ply, [0] = initial
-    std::vector<Move>  moveHistory;      // moves leading to those positions
-    int currentMoveIndex = 0;            // index into positionHistory
+    std::vector<std::string> positionHistory;
+    std::vector<uint64_t> repetitionHistory;
+    std::vector<Move> moveHistory;
+    int currentMoveIndex = 0;
 
     int lastFrom = -1;
     int lastTo = -1;
-
-    
 };

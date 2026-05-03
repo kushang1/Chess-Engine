@@ -1,134 +1,54 @@
-﻿#include "MainWindow.h"
+#include "MainWindow.h"
+
+#include <ChessEngine/EngineFacade.h>
 
 #include <QApplication>
+
 #include <chrono>
-#include <cstdlib>
 #include <cstdio>
 #include <exception>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
-#include <malloc.h>
-#include <new>
-#include <set>
 #include <string>
 #include <vector>
 #include <windows.h>
 
-#include "Board.h"
-#include "Engine.h"
-#include "MoveGenerator.h"
-#include "Profiler.h"
-
 namespace {
 
-using ProfileClock = std::chrono::high_resolution_clock;
-
-void* allocateAndProfile(std::size_t size, std::size_t alignment = 0)
+void attachConsole()
 {
-    const std::size_t allocationSize = size == 0 ? 1 : size;
-    if (!Profiler::countAllocations) {
-        void* ptr = alignment == 0
-            ? std::malloc(allocationSize)
-            : _aligned_malloc(allocationSize, alignment);
-        if (!ptr) {
-            throw std::bad_alloc();
-        }
-        return ptr;
+    if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+        FILE* stream = nullptr;
+        freopen_s(&stream, "CONOUT$", "w", stdout);
+        freopen_s(&stream, "CONOUT$", "w", stderr);
     }
-
-    auto start = ProfileClock::now();
-    void* ptr = alignment == 0
-        ? std::malloc(allocationSize)
-        : _aligned_malloc(allocationSize, alignment);
-    auto end = ProfileClock::now();
-
-    if (!ptr) {
-        throw std::bad_alloc();
-    }
-
-    Profiler::recordAllocation(allocationSize, static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
-    return ptr;
 }
 
-} // namespace
-
-void* operator new(std::size_t size) {
-    return allocateAndProfile(size);
-}
-
-void* operator new[](std::size_t size) {
-    return allocateAndProfile(size);
-}
-
-void operator delete(void* ptr) noexcept {
-    std::free(ptr);
-}
-
-void operator delete[](void* ptr) noexcept {
-    std::free(ptr);
-}
-
-void operator delete(void* ptr, std::size_t) noexcept {
-    std::free(ptr);
-}
-
-void operator delete[](void* ptr, std::size_t) noexcept {
-    std::free(ptr);
-}
-
-void* operator new(std::size_t size, std::align_val_t alignment) {
-    return allocateAndProfile(size, static_cast<std::size_t>(alignment));
-}
-
-void* operator new[](std::size_t size, std::align_val_t alignment) {
-    return allocateAndProfile(size, static_cast<std::size_t>(alignment));
-}
-
-void operator delete(void* ptr, std::align_val_t) noexcept {
-    _aligned_free(ptr);
-}
-
-void operator delete[](void* ptr, std::align_val_t) noexcept {
-    _aligned_free(ptr);
-}
-
-void operator delete(void* ptr, std::size_t, std::align_val_t) noexcept {
-    _aligned_free(ptr);
-}
-
-void operator delete[](void* ptr, std::size_t, std::align_val_t) noexcept {
-    _aligned_free(ptr);
-}
-
-static std::string squareToString(int sq)
+std::string squareToString(int square)
 {
-    int row = sq / 8;
-    int col = sq % 8;
     std::string out;
-    out.push_back(static_cast<char>('a' + col));
-    out.push_back(static_cast<char>('8' - row));
+    out.push_back(static_cast<char>('a' + (square & 7)));
+    out.push_back(static_cast<char>('8' - (square >> 3)));
     return out;
 }
 
-static std::string moveToString(const Move& move)
+std::string moveToString(const Move& move)
 {
     std::string out = squareToString(move.from) + squareToString(move.to);
     if (move.wasPromotion) {
-        char promo = 'q';
+        char promotion = 'q';
         switch (move.promotedTo) {
-        case WR: case BR: promo = 'r'; break;
-        case WB: case BB: promo = 'b'; break;
-        case WN: case BN: promo = 'n'; break;
+        case WR: case BR: promotion = 'r'; break;
+        case WB: case BB: promotion = 'b'; break;
+        case WN: case BN: promotion = 'n'; break;
         default: break;
         }
-        out.push_back(promo);
+        out.push_back(promotion);
     }
     return out;
 }
 
-static int countFenFields(const std::string& fen)
+int countFenFields(const std::string& fen)
 {
     int fields = 0;
     bool inField = false;
@@ -144,33 +64,9 @@ static int countFenFields(const std::string& fen)
     return fields;
 }
 
-static bool playMoveSequence(board& b, MoveGenerator& moveGenerator, int argc, char* argv[], int startIndex)
+bool setupPositionFromArgs(chess::ChessEngine& engine, int argc, char* argv[], int startIndex)
 {
-    for (int i = startIndex; i < argc; ++i) {
-        std::string wanted = argv[i];
-        auto moves = moveGenerator.generateLegalMoves(b);
-
-        bool found = false;
-        for (const Move& move : moves) {
-            if (moveToString(move) == wanted) {
-                b.makeMove(move);
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            std::cerr << "Illegal move in sequence: " << wanted << "\n";
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool setupPositionFromArgs(board& b, MoveGenerator& moveGenerator, int argc, char* argv[], int startIndex)
-{
-    b.resetBoard();
+    engine.newGame();
     int moveStart = startIndex;
 
     if (startIndex < argc && std::string(argv[startIndex]) == "--fen") {
@@ -191,360 +87,152 @@ static bool setupPositionFromArgs(board& b, MoveGenerator& moveGenerator, int ar
             return false;
         }
 
-        try {
-            b.loadFEN(fen);
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Invalid FEN after --fen: " << e.what() << "\n";
+        if (!engine.setPositionFromFen(fen)) {
+            std::cerr << "Invalid FEN after --fen\n";
             return false;
         }
     }
 
-    return playMoveSequence(b, moveGenerator, argc, argv, moveStart);
+    for (int i = moveStart; i < argc; ++i) {
+        std::string move = argv[i];
+        if (!engine.makeMoveUci(move)) {
+            std::cerr << "Illegal move in sequence: " << move << "\n";
+            return false;
+        }
+    }
+
+    return true;
 }
 
-static void generateReferenceLegalMoves(board& b, MoveGenerator& moveGenerator, MoveList& legal)
+int runSearchBench(int argc, char* argv[])
 {
-    legal.clear();
-    MoveList pseudo;
-    moveGenerator.generatePseudoLegalMoves(b, pseudo);
+    attachConsole();
 
-    for (Move& move : pseudo) {
-        Unmove undo = b.makeMove(move);
-        bool movingSideIsWhite = !b.isWhiteTurn;
-        int kingSq = b.kingSquare(movingSideIsWhite);
-        if (kingSq != -1 && !moveGenerator.isSquareAttacked(b, kingSq, b.isWhiteTurn)) {
-            legal.push_back(move);
-        }
-        b.unmakeMove(move, undo);
-    }
-}
-
-static bool findMismatch(board& b, MoveGenerator& moveGenerator, int depth, std::vector<std::string>& line, std::ostream& out)
-{
-    MoveList direct;
-    MoveList reference;
-    moveGenerator.generateLegalMoves(b, direct);
-    generateReferenceLegalMoves(b, moveGenerator, reference);
-
-    std::set<std::string> directSet;
-    std::set<std::string> referenceSet;
-
-    for (const Move& move : direct) directSet.insert(moveToString(move));
-    for (const Move& move : reference) referenceSet.insert(moveToString(move));
-
-    if (directSet != referenceSet) {
-        out << "Mismatch after line:";
-        for (const std::string& move : line) {
-            out << ' ' << move;
-        }
-        out << "\nDirect-only:\n";
-        for (const std::string& move : directSet) {
-            if (referenceSet.find(move) == referenceSet.end()) {
-                out << "  " << move << "\n";
-            }
-        }
-        out << "Reference-only:\n";
-        for (const std::string& move : referenceSet) {
-            if (directSet.find(move) == directSet.end()) {
-                out << "  " << move << "\n";
-            }
-        }
-        return true;
-    }
-
-    if (depth <= 1) {
-        return false;
-    }
-
-    for (const Move& move : reference) {
-        line.push_back(moveToString(move));
-        Unmove undo = b.makeMove(move);
-        bool found = findMismatch(b, moveGenerator, depth - 1, line, out);
-        b.unmakeMove(move, undo);
-        line.pop_back();
-        if (found) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static long long perft(int depth, board& b, MoveGenerator& moveGenerator)
-{
-    if (depth == 0) {
+    int depth = std::stoi(argv[2]);
+    chess::ChessEngine engine;
+    if (!setupPositionFromArgs(engine, argc, argv, 3)) {
         return 1;
     }
 
-    if (depth == 1) {
-        return moveGenerator.countLegalMoves(b);
+    chess::SearchLimits limits;
+    limits.maxDepth = depth;
+
+    auto start = std::chrono::high_resolution_clock::now();
+    engine.clearSearchStop();
+    chess::SearchResult result = engine.findBestMove(limits);
+    auto end = std::chrono::high_resolution_clock::now();
+
+    std::chrono::duration<double> elapsed = end - start;
+    std::ofstream out("search_bench_result.txt");
+
+    auto write = [&](std::ostream& os) {
+        os << "Search bench depth " << depth << "\n";
+        os << "Best move: " << moveToString(result.bestMove) << "\n";
+        os << "Time: " << elapsed.count() << " seconds\n";
+        os << "Nodes: " << result.nodes << "\n";
+        os << "Leaf nodes: " << result.leafNodes << "\n";
+        os << "Nodes/sec: "
+           << (elapsed.count() > 0.0
+               ? static_cast<long long>(result.nodes / elapsed.count())
+               : 0)
+           << "\n";
+    };
+
+    write(std::cout);
+    if (out) {
+        write(out);
     }
 
-    MoveList moves;
-    moveGenerator.generateLegalMoves(b, moves);
-
-    long long nodes = 0;
-    if (depth == 2) {
-        for (Move& move : moves) {
-            Unmove undo = b.makeMove(move);
-            nodes += moveGenerator.countLegalMoves(b);
-            b.unmakeMove(move, undo);
-        }
-        return nodes;
-    }
-
-    for (Move& move : moves) {
-        Unmove undo = b.makeMove(move);
-        nodes += perft(depth - 1, b, moveGenerator);
-        b.unmakeMove(move, undo);
-    }
-
-    return nodes;
+    return 0;
 }
 
-static long long perftReference(int depth, board& b, MoveGenerator& moveGenerator)
+int runPerftCommand(int argc, char* argv[])
 {
-    if (depth == 0) {
+    attachConsole();
+
+    std::string command = argv[1];
+    bool divide = command == "--divide";
+    int depth = std::stoi(argv[2]);
+
+    chess::ChessEngine engine;
+    if (!setupPositionFromArgs(engine, argc, argv, 3)) {
         return 1;
     }
 
-    MoveList moves;
-    generateReferenceLegalMoves(b, moveGenerator, moves);
-
+    auto start = std::chrono::high_resolution_clock::now();
     long long nodes = 0;
-    for (Move& move : moves) {
-        Unmove undo = b.makeMove(move);
-        if (depth == 1) {
-            ++nodes;
+    std::ofstream out("perft_result.txt");
+
+    if (divide) {
+        std::vector<chess::PerftDivideEntry> entries = engine.divide(depth);
+        for (const chess::PerftDivideEntry& entry : entries) {
+            nodes += entry.nodes;
+            std::cout << moveToString(entry.move) << ": " << entry.nodes << "\n";
+            if (out) {
+                out << moveToString(entry.move) << ": " << entry.nodes << "\n";
+            }
         }
-        else {
-            nodes += perftReference(depth - 1, b, moveGenerator);
+    }
+    else {
+        chess::PerftResult result = engine.perft(depth);
+        nodes = result.nodes;
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+
+    std::cout << (divide ? "Divide(" : "Perft(") << depth << ") nodes: " << nodes << "\n";
+    std::cout << "Time: " << elapsed.count() << " seconds\n";
+
+    if (out) {
+        out << (divide ? "Divide(" : "Perft(") << depth << ") nodes: " << nodes << "\n";
+        out << "Time: " << elapsed.count() << " seconds\n";
+    }
+
+    if (command == "--profile-perft") {
+        std::ofstream profileOut("profile_result.txt");
+        if (profileOut) {
+            profileOut << "Perft profile depth " << depth << "\n";
+            profileOut << "Nodes: " << nodes << "\n";
+            profileOut << "Total time: " << elapsed.count() << " seconds\n";
+            profileOut << "Detailed timing counters are not exposed by the facade.\n";
         }
-        b.unmakeMove(move, undo);
     }
 
-    return nodes;
+    return 0;
 }
 
-static const char* bucketName(Profiler::Bucket bucket)
-{
-    switch (bucket) {
-    case Profiler::MoveGeneration: return "Move generation";
-    case Profiler::LegalityChecking: return "Legality checking";
-    case Profiler::MakeMove: return "makeMove";
-    case Profiler::UndoMove: return "undoMove";
-    case Profiler::SlidingAttack: return "Sliding attack generation";
-    case Profiler::MemoryAllocation: return "Memory allocations";
-    case Profiler::HashState: return "Hashing / state updates";
-    default: return "Unknown";
-    }
-}
-
-static void writeProfileLine(std::ostream& out, const char* name, uint64_t ns, uint64_t calls,
-    uint64_t bytes, uint64_t totalNs)
-{
-    double ms = static_cast<double>(ns) / 1'000'000.0;
-    double pct = totalNs == 0 ? 0.0 : (static_cast<double>(ns) * 100.0 / static_cast<double>(totalNs));
-    out << std::left << std::setw(30) << name
-        << std::right << std::setw(12) << std::fixed << std::setprecision(3) << ms << " ms"
-        << std::setw(10) << std::setprecision(2) << pct << "%"
-        << std::setw(14) << calls << " calls";
-    if (bytes != 0) {
-        out << std::setw(14) << bytes << " bytes";
-    }
-    out << "\n";
-}
-
-static void writeProfileReport(std::ostream& out, int depth, long long nodes, uint64_t totalNs)
-{
-    out << "Perft profile depth " << depth << "\n";
-    out << "Nodes: " << nodes << "\n";
-    out << "Total time: " << std::fixed << std::setprecision(6)
-        << (static_cast<double>(totalNs) / 1'000'000'000.0) << " seconds\n";
-    out << "Nodes/sec: " << std::fixed << std::setprecision(0)
-        << (static_cast<double>(nodes) * 1'000'000'000.0 / static_cast<double>(totalNs)) << "\n\n";
-
-    out << "Breakdown:\n";
-    for (int bucket = 0; bucket < Profiler::BucketCount; ++bucket) {
-        const Profiler::Counter& counter = Profiler::counters[bucket];
-        writeProfileLine(out, bucketName(static_cast<Profiler::Bucket>(bucket)),
-            counter.nanoseconds, counter.calls, counter.bytes, totalNs);
-    }
-
-    uint64_t accountedNs =
-        Profiler::counters[Profiler::MoveGeneration].nanoseconds +
-        Profiler::counters[Profiler::MakeMove].nanoseconds +
-        Profiler::counters[Profiler::UndoMove].nanoseconds +
-        Profiler::counters[Profiler::MemoryAllocation].nanoseconds;
-    uint64_t recursionNs = totalNs > accountedNs ? (totalNs - accountedNs) : 0;
-
-    writeProfileLine(out, "Recursion / loop overhead", recursionNs, 0, 0, totalNs);
-    out << "\nNote: legality, sliding attacks, and hashing/state updates are nested sub-costs inside movegen/make/undo.\n";
-}
+} // namespace
 
 int main(int argc, char* argv[])
 {
-    if (argc >= 3 && std::string(argv[1]) == "--find-mismatch") {
-        if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
-            FILE* stream = nullptr;
-            freopen_s(&stream, "CONOUT$", "w", stdout);
-            freopen_s(&stream, "CONOUT$", "w", stderr);
+    try {
+        if (argc >= 3 && std::string(argv[1]) == "--bench-search") {
+            return runSearchBench(argc, argv);
         }
 
-        int depth = std::stoi(argv[2]);
-        board b;
-        MoveGenerator moveGenerator;
-        if (!setupPositionFromArgs(b, moveGenerator, argc, argv, 3)) {
-            return 1;
+        if (argc >= 3 &&
+            (std::string(argv[1]) == "--perft" ||
+             std::string(argv[1]) == "--divide" ||
+             std::string(argv[1]) == "--perft-ref" ||
+             std::string(argv[1]) == "--profile-perft")) {
+            return runPerftCommand(argc, argv);
         }
 
-        std::ofstream out("mismatch_result.txt");
-        std::vector<std::string> line;
-        bool found = findMismatch(b, moveGenerator, depth, line, std::cout);
-        if (out) {
-            findMismatch(b, moveGenerator, depth, line, out);
+        if (argc >= 3 && std::string(argv[1]) == "--find-mismatch") {
+            attachConsole();
+            std::cerr << "--find-mismatch is not exposed from ChessQtApp after the facade migration.\n";
+            return 2;
         }
-        if (!found) {
-            std::cout << "No mismatch found up to depth " << depth << "\n";
-            if (out) {
-                out << "No mismatch found up to depth " << depth << "\n";
-            }
-        }
-        return 0;
+    }
+    catch (const std::exception& e) {
+        attachConsole();
+        std::cerr << e.what() << "\n";
+        return 1;
     }
 
-    if (argc >= 3 && std::string(argv[1]) == "--bench-search") {
-        if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
-            FILE* stream = nullptr;
-            freopen_s(&stream, "CONOUT$", "w", stdout);
-            freopen_s(&stream, "CONOUT$", "w", stderr);
-        }
-
-        int depth = std::stoi(argv[2]);
-        board b;
-        MoveGenerator moveGenerator;
-        if (!setupPositionFromArgs(b, moveGenerator, argc, argv, 3)) {
-            return 1;
-        }
-
-        Engine engine;
-        engine.moveGenerator = &moveGenerator;
-        std::vector<uint64_t> reps;
-
-        Profiler::reset();
-        Profiler::countAllocations = true;
-        auto start = std::chrono::high_resolution_clock::now();
-        Move best = engine.findBestMove(b, depth, reps);
-        auto end = std::chrono::high_resolution_clock::now();
-        Profiler::countAllocations = false;
-
-        std::chrono::duration<double> elapsed = end - start;
-        uint64_t allocationCalls = Profiler::allocationCalls.load(std::memory_order_relaxed);
-        uint64_t allocationBytes = Profiler::allocationBytes.load(std::memory_order_relaxed);
-
-        std::ofstream out("search_bench_result.txt");
-        auto write = [&](std::ostream& os) {
-            os << "Search bench depth " << depth << "\n";
-            os << "Best move: " << moveToString(best) << "\n";
-            os << "Time: " << elapsed.count() << " seconds\n";
-            os << "Nodes: " << engine.nodesSearched() << "\n";
-            os << "Leaf nodes: " << engine.leafNodesSearched() << "\n";
-            os << "Nodes/sec: "
-               << (elapsed.count() > 0.0
-                   ? static_cast<long long>(engine.nodesSearched() / elapsed.count())
-                   : 0)
-               << "\n";
-            os << "Heap allocations during search: " << allocationCalls << "\n";
-            os << "Heap bytes during search: " << allocationBytes << "\n";
-        };
-
-        write(std::cout);
-        if (out) {
-            write(out);
-        }
-
-        return 0;
-    }
-
-    if (argc >= 3 &&
-        (std::string(argv[1]) == "--perft" ||
-         std::string(argv[1]) == "--divide" ||
-         std::string(argv[1]) == "--perft-ref" ||
-         std::string(argv[1]) == "--profile-perft")) {
-        if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
-            FILE* stream = nullptr;
-            freopen_s(&stream, "CONOUT$", "w", stdout);
-            freopen_s(&stream, "CONOUT$", "w", stderr);
-        }
-
-        bool divide = (std::string(argv[1]) == "--divide");
-        bool referencePerft = (std::string(argv[1]) == "--perft-ref");
-        bool profilePerft = (std::string(argv[1]) == "--profile-perft");
-        int depth = std::stoi(argv[2]);
-
-        board b;
-
-        MoveGenerator moveGenerator;
-        if (!setupPositionFromArgs(b, moveGenerator, argc, argv, 3)) {
-            return 1;
-        }
-
-        Profiler::reset();
-        Profiler::enabled = profilePerft;
-        Profiler::countAllocations = profilePerft;
-
-        auto start = std::chrono::high_resolution_clock::now();
-        long long nodes = 0;
-        std::ofstream out("perft_result.txt");
-
-        if (divide) {
-            MoveList moves;
-            moveGenerator.generateLegalMoves(b, moves);
-            for (Move& move : moves) {
-                Unmove undo = b.makeMove(move);
-                long long childNodes = perft(depth - 1, b, moveGenerator);
-                b.unmakeMove(move, undo);
-                nodes += childNodes;
-                std::cout << moveToString(move) << ": " << childNodes << "\n";
-                if (out) {
-                    out << moveToString(move) << ": " << childNodes << "\n";
-                }
-            }
-        }
-        else {
-            nodes = referencePerft
-                ? perftReference(depth, b, moveGenerator)
-                : perft(depth, b, moveGenerator);
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-        Profiler::countAllocations = false;
-        Profiler::enabled = false;
-
-        std::chrono::duration<double> elapsed = end - start;
-        uint64_t totalNs = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-        std::cout << (divide ? "Divide(" : "Perft(") << depth << ") nodes: " << nodes << "\n";
-        std::cout << "Time: " << elapsed.count() << " seconds\n";
-
-        if (out) {
-            out << (divide ? "Divide(" : "Perft(") << depth << ") nodes: " << nodes << "\n";
-            out << "Time: " << elapsed.count() << " seconds\n";
-        }
-
-        if (profilePerft) {
-            std::ofstream profileOut("profile_result.txt");
-            writeProfileReport(std::cout, depth, nodes, totalNs);
-            if (profileOut) {
-                writeProfileReport(profileOut, depth, nodes, totalNs);
-            }
-        }
-
-        return 0;
-    }
-
-    QApplication a(argc, argv);
-    MainWindow w;
-    w.show();
-    return a.exec();
+    QApplication app(argc, argv);
+    MainWindow window;
+    window.show();
+    return app.exec();
 }

@@ -77,9 +77,11 @@ private:
     int timeLimitMs = 1000;  // default: 5 seconds per move
 
     std::vector<PolyglotEntry> openingBook;
+    bool externalDataInitialized = false;
 
+    void initializeExternalData();
     bool loadOpeningBook(const std::string& filename);
-    Move probeBook(const board& b);
+    Move probeBook(board& b);
 
 };
 

@@ -11,18 +11,18 @@ namespace {
 
 int polyID(Piece p) {
     switch (p) {
-    case WP: return 0;
-    case WN: return 1;
-    case WB: return 2;
-    case WR: return 3;
-    case WQ: return 4;
-    case WK: return 5;
-    case BP: return 6;
-    case BN: return 7;
-    case BB: return 8;
-    case BR: return 9;
-    case BQ: return 10;
-    case BK: return 11;
+    case BP: return 0;
+    case WP: return 1;
+    case BN: return 2;
+    case WN: return 3;
+    case BB: return 4;
+    case WB: return 5;
+    case BR: return 6;
+    case WR: return 7;
+    case BQ: return 8;
+    case WQ: return 9;
+    case BK: return 10;
+    case WK: return 11;
     default: return -1;
     }
 }

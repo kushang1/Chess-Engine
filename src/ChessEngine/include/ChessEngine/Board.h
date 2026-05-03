@@ -9,7 +9,7 @@
 #include "Bitboard.h"
 #include "Move.h"
 
-class CHESS_API board
+class board
 {
 public:
     board();

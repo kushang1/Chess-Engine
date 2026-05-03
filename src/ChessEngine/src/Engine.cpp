@@ -4,9 +4,22 @@
 #include "Engine.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <iomanip>
 #include <new>
 #include <random>
+#include <sstream>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <io.h>
+#include <windows.h>
+#endif
 
 
 std::atomic<long long> leafNodes{ 0 };
@@ -20,9 +33,213 @@ static const int INF = 2000000000;
 
 namespace {
 
+namespace fs = std::filesystem;
+
 constexpr int DefaultHashMb = 128;
 constexpr int MinHashMb = 1;
 constexpr int MaxHashMb = 4096;
+constexpr int MaxBookSelectionPool = 8;
+
+void engineLog(const std::string& text)
+{
+#ifdef _WIN32
+	const std::string debugLine = "info string " + text + "\n";
+	OutputDebugStringA(debugLine.c_str());
+	if (stderr == nullptr || _fileno(stderr) < 0) {
+		return;
+	}
+#else
+	if (stderr == nullptr) {
+		return;
+	}
+#endif
+	std::fprintf(stderr, "info string %s\n", text.c_str());
+	std::fflush(stderr);
+}
+
+std::mt19937_64& bookRng()
+{
+	static std::mt19937_64 rng(std::random_device{}());
+	return rng;
+}
+
+std::string moveToUciText(const Move& move)
+{
+	if (move.from < 0 || move.to < 0) {
+		return "0000";
+	}
+
+	auto square = [](int sq) {
+		std::string out;
+		out.push_back(static_cast<char>('a' + (sq & 7)));
+		out.push_back(static_cast<char>('8' - (sq >> 3)));
+		return out;
+	};
+
+	std::string out = square(move.from) + square(move.to);
+	if (move.wasPromotion) {
+		char promotion = 'q';
+		switch (move.promotedTo) {
+		case WR: case BR: promotion = 'r'; break;
+		case WB: case BB: promotion = 'b'; break;
+		case WN: case BN: promotion = 'n'; break;
+		default: break;
+		}
+		out.push_back(promotion);
+	}
+	return out;
+}
+
+bool sameMoveIdentity(const Move& lhs, const Move& rhs)
+{
+	if (lhs.from != rhs.from || lhs.to != rhs.to) {
+		return false;
+	}
+	if (lhs.wasPromotion != rhs.wasPromotion) {
+		return false;
+	}
+	return !lhs.wasPromotion || lhs.promotedTo == rhs.promotedTo;
+}
+
+bool findLegalEquivalent(const std::vector<Move>& legalMoves, const Move& candidate, Move& legalMove)
+{
+	for (const Move& legal : legalMoves) {
+		if (sameMoveIdentity(legal, candidate)) {
+			legalMove = legal;
+			return true;
+		}
+	}
+	return false;
+}
+
+void addUniquePath(std::vector<fs::path>& paths, const fs::path& path)
+{
+	if (path.empty()) {
+		return;
+	}
+
+	fs::path normalized = path.lexically_normal();
+	auto existing = std::find(paths.begin(), paths.end(), normalized);
+	if (existing == paths.end()) {
+		paths.push_back(normalized);
+	}
+}
+
+void addRootAndParents(std::vector<fs::path>& roots, fs::path root)
+{
+	std::error_code ec;
+	root = fs::absolute(root, ec);
+	if (ec) {
+		return;
+	}
+
+	for (int i = 0; i < 6 && !root.empty(); ++i) {
+		addUniquePath(roots, root);
+		fs::path parent = root.parent_path();
+		if (parent == root) {
+			break;
+		}
+		root = parent;
+	}
+}
+
+fs::path executableDirectory()
+{
+#ifdef _WIN32
+	char buffer[MAX_PATH] = {};
+	DWORD length = GetModuleFileNameA(nullptr, buffer, MAX_PATH);
+	if (length != 0 && length < MAX_PATH) {
+		return fs::path(buffer).parent_path();
+	}
+#endif
+	return {};
+}
+
+std::vector<fs::path> searchRoots()
+{
+	std::vector<fs::path> roots;
+	std::error_code ec;
+	addRootAndParents(roots, fs::current_path(ec));
+	addRootAndParents(roots, executableDirectory());
+	return roots;
+}
+
+bool isRegularFile(const fs::path& path)
+{
+	std::error_code ec;
+	return fs::is_regular_file(path, ec);
+}
+
+bool isDirectory(const fs::path& path)
+{
+	std::error_code ec;
+	return fs::is_directory(path, ec);
+}
+
+fs::path resolveOpeningBookPath()
+{
+	std::vector<fs::path> candidates;
+
+	if (const char* envFile = std::getenv("CHESS_BOOK_FILE")) {
+		if (std::strcmp(envFile, "<empty>") == 0) {
+			return {};
+		}
+		addUniquePath(candidates, envFile);
+	}
+	if (const char* envBook = std::getenv("CHESS_BOOK")) {
+		if (std::strcmp(envBook, "<empty>") == 0) {
+			return {};
+		}
+		fs::path envPath(envBook);
+		addUniquePath(candidates, envPath);
+		addUniquePath(candidates, envPath / "book.bin");
+		addUniquePath(candidates, envPath / "Perfect2023.bin");
+		addUniquePath(candidates, envPath / "komodo.bin");
+		addUniquePath(candidates, envPath / "Human.bin");
+	}
+
+	for (const fs::path& root : searchRoots()) {
+		addUniquePath(candidates, root / "Book" / "Human.bin");
+		addUniquePath(candidates, root / "Book" / "Perfect2023.bin");
+		addUniquePath(candidates, root / "Book" / "komodo.bin");
+		addUniquePath(candidates, root / "Book" / "Perfect2023.bin");
+		addUniquePath(candidates, root / "Human.bin");
+	}
+
+	for (const fs::path& candidate : candidates) {
+		if (isRegularFile(candidate)) {
+			return candidate;
+		}
+	}
+
+	return {};
+}
+
+std::string resolveSyzygyPath()
+{
+	if (const char* envPath = std::getenv("CHESS_SYZYGY_PATH")) {
+		if (std::strcmp(envPath, "<empty>") == 0) {
+			return {};
+		}
+		if (*envPath != '\0') {
+			return envPath;
+		}
+	}
+
+	std::vector<fs::path> candidates;
+	for (const fs::path& root : searchRoots()) {
+		addUniquePath(candidates, root / "syzygy");
+		addUniquePath(candidates, root / "Syzygy");
+	}
+
+	for (const fs::path& candidate : candidates) {
+		if (isDirectory(candidate)) {
+			return candidate.string();
+		}
+	}
+
+	return {};
+}
 
 uint64_t floorPowerOfTwo(uint64_t value)
 {
@@ -65,12 +282,37 @@ Engine::Engine() : stopSearch(false) {
 	memset(historyHeuristic, 0, sizeof(historyHeuristic));
 
 	resizeTranspositionTable(DefaultHashMb);
+	initializeExternalData();
 
 }
 
 
 Engine::~Engine() {
 	delete[] tt;
+}
+
+void Engine::initializeExternalData()
+{
+	if (externalDataInitialized) {
+		return;
+	}
+	externalDataInitialized = true;
+
+	std::filesystem::path bookPath = resolveOpeningBookPath();
+	if (!bookPath.empty()) {
+		loadOpeningBook(bookPath.string());
+	}
+	else {
+		engineLog("book file not found; set CHESS_BOOK_FILE or place a Polyglot book under Book\\Human.bin");
+	}
+
+	std::string syzygyPath = resolveSyzygyPath();
+	if (!syzygyPath.empty()) {
+		initSyzygy(syzygyPath.c_str());
+	}
+	else {
+		engineLog("syzygy path not found; set CHESS_SYZYGY_PATH or place tablebases under syzygy");
+	}
 }
 
 void Engine::resetSearchStats()
@@ -537,6 +779,8 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	const std::vector<uint64_t>& globalReps)
 {
 	resetSearchStats();
+	
+
 	maxDepth = std::clamp(maxDepth, 1, MAX_DEPTH - 1);
 	this->maxDepth = maxDepth;
 
@@ -544,6 +788,26 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	if (bookMove.from != -1)
 	{
 		return bookMove;
+	}
+
+	int rootPieceCount = 0;
+	for (int p = BQ; p <= WB; ++p) {
+		rootPieceCount += b.pieceCount[p];
+	}
+	if (syzygyIsAvailable() &&
+		rootPieceCount <= static_cast<int>(syzygyMaxPieces()) &&
+		b.castleRights == 0) {
+		int tbScore = 0;
+		Move tbMove;
+		if (probeSyzygyRoot(b, tbScore, tbMove) && tbMove.from != -1) {
+			std::vector<Move> legalMoves = moveGenerator->generateLegalMoves(b);
+			Move legalTbMove;
+			if (findLegalEquivalent(legalMoves, tbMove, legalTbMove)) {
+				engineLog("syzygy selected root move: " + moveToUciText(legalTbMove));
+				return legalTbMove;
+			}
+			engineLog("syzygy root move rejected as illegal: " + moveToUciText(tbMove));
+		}
 	}
 
 	// --------------------------------------------
@@ -1180,47 +1444,71 @@ static uint16_t read_be_u16(const uint8_t* b) {
 
 bool Engine::loadOpeningBook(const std::string& filename)
 {
+	std::error_code ec;
+	uintmax_t fileBytes = std::filesystem::file_size(filename, ec);
+	if (!ec && (fileBytes % 16) != 0) {
+		std::ostringstream log;
+		log << "book file size is not a multiple of 16 bytes: " << filename
+			<< " bytes=" << fileBytes;
+		engineLog(log.str());
+	}
+
 	FILE* f = nullptr;
 	fopen_s(&f, filename.c_str(), "rb");
 	if (!f) {
+		engineLog("book file open failed: " + filename);
 		return false;
 	}
 
 	openingBook.clear();
+	if (!ec) {
+		openingBook.reserve(static_cast<size_t>(fileBytes / 16));
+	}
 
 	uint8_t buf[16];
-	size_t count = 0;
+	uint16_t maxWeight = 0;
+	size_t weightedEntries = 0;
 	while (fread(buf, 1, 16, f) == 16) {
 		PolyglotEntry e;
 		e.key = read_be_u64(buf + 0);
 		e.move = read_be_u16(buf + 8);
 		e.weight = read_be_u16(buf + 10);
 		e.learn = read_be_u32(buf + 12);
+		maxWeight = std::max(maxWeight, e.weight);
+		if (e.weight > 1) {
+			++weightedEntries;
+		}
 		openingBook.push_back(e);
-
-		++count;
 	}
 
 	fclose(f);
 
 	if (openingBook.empty()) {
+		engineLog("book file contained no complete entries: " + filename);
 		return false;
 	}
+
+	std::ostringstream log;
+	log << "book file loaded successfully: " << filename
+		<< " entries=" << openingBook.size()
+		<< " max_weight=" << maxWeight
+		<< " weighted_entries=" << weightedEntries;
+	engineLog(log.str());
+	if (maxWeight <= 1) {
+		engineLog("book weights appear uninformative; weighted variety will fall back to equal random choice");
+	}
 	return true;
-
-	std::vector<Move> temp;
-
-	/*for (int i = 0; i < 10; i++) {
-		temp.push_back(polyglotDecodeMove(openingBook[i].move));
-	}*/
 }
 
 
 
 
-Move Engine::probeBook(const board& b)
+Move Engine::probeBook(board& b)
 {
-	if (openingBook.empty()) return Move();
+	if (openingBook.empty()) {
+		engineLog("book unavailable: no entries loaded");
+		return Move();
+	}
 
 	uint64_t key = polyglotHash(b);
 
@@ -1229,26 +1517,88 @@ Move Engine::probeBook(const board& b)
 		if (e.key == key)
 			matches.push_back(&e);
 
-	if (matches.empty()) return Move();
+	if (matches.empty()) {
+		std::ostringstream log;
+		log << "book no hit: key=0x" << std::hex << key;
+		engineLog(log.str());
+		return Move();
+	}
+
+	if (moveGenerator == nullptr) {
+		engineLog("book hit ignored: move generator is not attached");
+		return Move();
+	}
+
+	std::vector<Move> legalMoves = moveGenerator->generateLegalMoves(b);
+
+	struct BookCandidate {
+		Move move;
+		uint16_t weight;
+		uint16_t rawMove;
+	};
+
+	std::vector<BookCandidate> candidates;
+	candidates.reserve(matches.size());
+	int rejected = 0;
+	for (const PolyglotEntry* entry : matches) {
+		Move decoded = polyglotDecodeMove(entry->move, b);
+		Move legal;
+		if (findLegalEquivalent(legalMoves, decoded, legal)) {
+			candidates.push_back(BookCandidate{ legal, entry->weight, entry->move });
+		}
+		else {
+			++rejected;
+		}
+	}
+
+	if (candidates.empty()) {
+		std::ostringstream log;
+		log << "book hit rejected: key=0x" << std::hex << key
+			<< std::dec << " matching_entries=" << matches.size()
+			<< " legal_candidates=0 rejected=" << rejected;
+		engineLog(log.str());
+		return Move();
+	}
 
 	// ---------------------------------------
-	// Sort matches by weight descending
+	// Sort legal book moves by weight descending.
 	// ---------------------------------------
-	std::sort(matches.begin(), matches.end(),
-		[](const PolyglotEntry* a, const PolyglotEntry* b) {
-			return a->weight > b->weight;
+	std::sort(candidates.begin(), candidates.end(),
+		[](const BookCandidate& a, const BookCandidate& b) {
+			return a.weight > b.weight;
 		});
 
-	// ---------------------------------------
-	// Pick randomly from top 3
-	// ---------------------------------------
-	int take = std::min(3, (int)matches.size());
+	int topWeight = candidates.front().weight;
+	int threshold = topWeight > 1 ? std::max(1, (topWeight * 25) / 100) : topWeight;
+	int poolSize = 0;
+	while (poolSize < static_cast<int>(candidates.size()) &&
+		poolSize < MaxBookSelectionPool &&
+		candidates[poolSize].weight >= threshold) {
+		++poolSize;
+	}
+	if (poolSize == 0) {
+		poolSize = 1;
+	}
 
-	static std::mt19937_64 rng(std::random_device{}());
-	std::uniform_int_distribution<int> dist(0, take - 1);
+	std::vector<double> selectionWeights;
+	selectionWeights.reserve(poolSize);
+	for (int i = 0; i < poolSize; ++i) {
+		selectionWeights.push_back(candidates[i].weight > 0 ? candidates[i].weight : 1.0);
+	}
 
-	int idx = dist(rng);
-	const PolyglotEntry* chosen = matches[idx];
+	std::discrete_distribution<int> dist(selectionWeights.begin(), selectionWeights.end());
+	const BookCandidate& chosen = candidates[dist(bookRng())];
 
-	return polyglotDecodeMove(chosen->move, b);
+	std::ostringstream log;
+	log << "book hit: key=0x" << std::hex << key
+		<< std::dec << " matching_entries=" << matches.size()
+		<< " legal_candidates=" << candidates.size()
+		<< " rejected=" << rejected
+		<< " selection_pool=" << poolSize
+		<< " selected=" << moveToUciText(chosen.move)
+		<< " weight=" << chosen.weight
+		<< " raw=0x" << std::hex << chosen.rawMove;
+	engineLog(log.str());
+
+	return chosen.move;
 }

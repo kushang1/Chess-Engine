@@ -3,7 +3,6 @@
 #include <ChessEngine/EngineFacade.h>
 
 #include <atomic>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,7 +53,6 @@ private:
     std::vector<uint64_t> repetitionHistory;
     std::thread searchThread;
     std::atomic<bool> searchRunning{ false };
-    std::mutex outputMutex;
     int moveOverheadMs = 30;
     int hashSizeMb = 128;
     int searchThreads = 1;

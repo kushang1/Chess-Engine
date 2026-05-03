@@ -6,6 +6,13 @@
 #include <iostream>
 #include <sstream>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 constexpr int DefaultMoveTimeMs = 1000;
@@ -399,10 +406,20 @@ void UciLoop::stopSearch()
 
 void UciLoop::writeLine(const std::string& text)
 {
-    std::lock_guard<std::mutex> lock(outputMutex);
+#ifdef _WIN32
+    const std::string line = text + "\n";
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == nullptr || output == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    DWORD written = 0;
+    WriteFile(output, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+#else
     std::fputs(text.c_str(), stdout);
     std::fputc('\n', stdout);
     std::fflush(stdout);
+#endif
 }
 
 std::vector<std::string> UciLoop::split(const std::string& line)

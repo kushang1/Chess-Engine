@@ -67,7 +67,7 @@ struct MoveList {
     }
 };
 
-class CHESS_API MoveGenerator
+class MoveGenerator
 {
 public:
     MoveGenerator();

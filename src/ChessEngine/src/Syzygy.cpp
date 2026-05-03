@@ -1,28 +1,87 @@
-﻿#include "Syzygy.h"
+#include "Syzygy.h"
+
+#include <cstdio>
+#include <sstream>
+
 #include "Board.h"
 #include "tbprobe.h"
 
-static inline int flip_sq(int sq) {
-    return sq ^ 56;   // maps your index to Syzygy index
-}
+#ifdef _WIN32
+#include <io.h>
+#endif
 
+namespace {
 
-// Simple global flag: did tb_init succeed?
-static bool g_tbInitialized = false;
+bool g_tbInitialized = false;
 
-// ------------------------------------------------------------------
-// INITIALIZE SYZYGY (call once from main or Engine ctor)
-// ------------------------------------------------------------------
-bool initSyzygy(const char* path)
+inline int flip_sq(int sq)
 {
-    g_tbInitialized = tb_init(path);  // tb_init is from tbprobe.h
-    return g_tbInitialized;
+    return sq ^ 56;
 }
 
-// ------------------------------------------------------------------
-// Helper: build bitboards from your board representation
-// ------------------------------------------------------------------
-static void build_bitboards(board& b,
+void syzygyLog(const std::string& text)
+{
+#ifdef _WIN32
+    if (stderr == nullptr || _fileno(stderr) < 0) {
+        return;
+    }
+#else
+    if (stderr == nullptr) {
+        return;
+    }
+#endif
+    std::fprintf(stderr, "info string %s\n", text.c_str());
+    std::fflush(stderr);
+}
+
+void syzygyLimitedProbeLog(const std::string& text)
+{
+    static int emitted = 0;
+    if (emitted >= 32) {
+        return;
+    }
+
+    ++emitted;
+    syzygyLog(text);
+}
+
+const char* wdlName(unsigned wdl)
+{
+    switch (wdl) {
+    case TB_LOSS: return "loss";
+    case TB_BLESSED_LOSS: return "blessed_loss";
+    case TB_DRAW: return "draw";
+    case TB_CURSED_WIN: return "cursed_win";
+    case TB_WIN: return "win";
+    default: return "unknown";
+    }
+}
+
+int scoreFromWdl(unsigned wdl)
+{
+    switch (wdl) {
+    case TB_WIN:
+    case TB_CURSED_WIN:
+        return 30000;
+    case TB_LOSS:
+    case TB_BLESSED_LOSS:
+        return -30000;
+    case TB_DRAW:
+    default:
+        return 0;
+    }
+}
+
+unsigned syzygyEpSquare(const board& b)
+{
+    if (!b.hasEnPassant || b.enPassantSquare < 0) {
+        return 0;
+    }
+
+    return static_cast<unsigned>(flip_sq(b.enPassantSquare));
+}
+
+void build_bitboards(const board& b,
     uint64_t& white,
     uint64_t& black,
     uint64_t& kings,
@@ -41,13 +100,16 @@ static void build_bitboards(board& b,
         for (int i = 0; i < b.pieceCount[piece]; ++i) {
             int sq = b.pieceList[piece][i];
             ++pieceCount;
-            int tb_sq = flip_sq(sq);
-            uint64_t bb = (1ULL << tb_sq);
 
-            if (b.isWhitePiece(piece))
+            int tbSq = flip_sq(sq);
+            uint64_t bb = 1ULL << tbSq;
+
+            if (b.isWhitePiece(piece)) {
                 white |= bb;
-            else
+            }
+            else {
                 black |= bb;
+            }
 
             switch (piece) {
             case WK: case BK: kings |= bb; break;
@@ -62,148 +124,200 @@ static void build_bitboards(board& b,
     }
 }
 
-// ------------------------------------------------------------------
-// MAIN PROBE FUNCTION
-// ------------------------------------------------------------------
+bool prepareProbe(const board& b,
+    const char* mode,
+    uint64_t& white,
+    uint64_t& black,
+    uint64_t& kings,
+    uint64_t& queens,
+    uint64_t& rooks,
+    uint64_t& bishops,
+    uint64_t& knights,
+    uint64_t& pawns,
+    int& pieceCount)
+{
+    if (!syzygyIsAvailable()) {
+        std::ostringstream log;
+        log << "syzygy " << mode << " probe skipped: tablebases are not available";
+        syzygyLimitedProbeLog(log.str());
+        return false;
+    }
+
+    build_bitboards(b, white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount);
+
+    if (pieceCount > static_cast<int>(TB_LARGEST)) {
+        std::ostringstream log;
+        log << "syzygy " << mode << " probe skipped: " << pieceCount
+            << " pieces exceeds supported max " << TB_LARGEST;
+        syzygyLimitedProbeLog(log.str());
+        return false;
+    }
+
+    if (b.castleRights != 0) {
+        std::ostringstream log;
+        log << "syzygy " << mode << " probe skipped: castling rights are not supported";
+        syzygyLimitedProbeLog(log.str());
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
+bool initSyzygy(const char* path)
+{
+    const char* safePath = path != nullptr ? path : "";
+    g_tbInitialized = tb_init(safePath);
+
+    std::ostringstream log;
+    if (!g_tbInitialized) {
+        log << "syzygy init failed: " << safePath;
+        syzygyLog(log.str());
+        return false;
+    }
+
+    if (TB_LARGEST == 0) {
+        log << "syzygy path initialized but no tablebase files were found: " << safePath;
+        syzygyLog(log.str());
+        return false;
+    }
+
+    log << "syzygy path loaded: " << safePath
+        << " max pieces supported: " << TB_LARGEST;
+    syzygyLog(log.str());
+    return true;
+}
+
+bool syzygyIsAvailable()
+{
+    return g_tbInitialized && TB_LARGEST != 0;
+}
+
+unsigned syzygyMaxPieces()
+{
+    return syzygyIsAvailable() ? TB_LARGEST : 0;
+}
+
 bool probeSyzygy(board& b, int& outScore, Move& outBestMove)
 {
-    outBestMove = Move();  // default invalid
+    outBestMove = Move();
     outScore = 0;
-
-    if (!g_tbInitialized)
-        return false;
-
-    // If no TB files were found, TB_LARGEST is 0
-    if (TB_LARGEST == 0)
-        return false;
 
     uint64_t white, black, kings, queens, rooks, bishops, knights, pawns;
     int pieceCount;
-    build_bitboards(b, white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount);
-
-    // If more pieces than the largest TB we have, just skip
-    if (pieceCount > (int)TB_LARGEST)
+    if (!prepareProbe(b, "WDL", white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount)) {
         return false;
+    }
 
-    // 50-move and castling: for endgames we don't care about rule50 or castling
-    // (Fathom ignores castling and requires rule50 == 0 in tb_probe_wdl).
-    unsigned rule50 = 0;
-    unsigned castling = 0;
+    unsigned wdl = tb_probe_wdl(
+        white, black,
+        kings, queens, rooks, bishops, knights, pawns,
+        0, 0, syzygyEpSquare(b), b.isWhiteTurn
+    );
 
-    // EP square: 0 means "no EP"; EP can never be on a1 so this is safe.
-    unsigned ep = 0;
-    if (b.hasEnPassant)
-        ep = flip_sq(b.enPassantSquare);
+    if (wdl == TB_RESULT_FAILED) {
+        std::ostringstream log;
+        log << "syzygy WDL probe failed/missing for " << pieceCount << "-piece position";
+        syzygyLimitedProbeLog(log.str());
+        return false;
+    }
 
+    outScore = scoreFromWdl(wdl);
 
-    bool turn = b.isWhiteTurn;
+    std::ostringstream log;
+    log << "syzygy WDL probe hit: " << pieceCount
+        << " pieces wdl=" << wdlName(wdl)
+        << " score=" << outScore;
+    syzygyLimitedProbeLog(log.str());
+    return true;
+}
 
-    // First try root probe (gives move + DTZ / WDL info)
+bool probeSyzygyRoot(board& b, int& outScore, Move& outBestMove)
+{
+    outBestMove = Move();
+    outScore = 0;
+
+    uint64_t white, black, kings, queens, rooks, bishops, knights, pawns;
+    int pieceCount;
+    if (!prepareProbe(b, "root DTZ", white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount)) {
+        return false;
+    }
+
     unsigned tbRes = tb_probe_root(
         white, black,
         kings, queens, rooks, bishops, knights, pawns,
-        rule50, castling, ep, turn,
-        nullptr // no per-move results array
+        static_cast<unsigned>(b.halfmoveClock),
+        0,
+        syzygyEpSquare(b),
+        b.isWhiteTurn,
+        nullptr
     );
 
     if (tbRes == TB_RESULT_FAILED) {
-        // Fall back to WDL-only probe
-        unsigned wdl = tb_probe_wdl(
-            white, black,
-            kings, queens, rooks, bishops, knights, pawns,
-            rule50, castling, ep, turn
-        );
+        std::ostringstream log;
+        log << "syzygy root DTZ probe failed/missing for " << pieceCount << "-piece position";
+        syzygyLog(log.str());
+        return false;
+    }
 
-        if (wdl == TB_RESULT_FAILED)
-            return false;
+    if (tbRes == TB_RESULT_CHECKMATE || tbRes == TB_RESULT_STALEMATE) {
+        unsigned terminalWdl = TB_GET_WDL(tbRes);
+        outScore = scoreFromWdl(terminalWdl);
 
-        int score;
-        switch (wdl) {
-        case TB_WIN:
-        case TB_CURSED_WIN:
-            score = 30000;  // big win
-            break;
-        case TB_LOSS:
-        case TB_BLESSED_LOSS:
-            score = -30000; // big loss
-            break;
-        case TB_DRAW:
-        default:
-            score = 0;
-            break;
-        }
-
-        outScore = score;
-        // No specific move from WDL probe alone
-        outBestMove = Move();
+        std::ostringstream log;
+        log << "syzygy root DTZ probe hit terminal position: wdl="
+            << wdlName(terminalWdl) << " score=" << outScore;
+        syzygyLog(log.str());
         return true;
     }
 
-    // Decode WDL from tbRes
     unsigned wdl = TB_GET_WDL(tbRes);
-    int score;
-    switch (wdl) {
-    case TB_WIN:
-    case TB_CURSED_WIN:
-        score = 30000;
-        break;
-    case TB_LOSS:
-    case TB_BLESSED_LOSS:
-        score = -30000;
-        break;
-    case TB_DRAW:
-    default:
-        score = 0;
-        break;
+    outScore = scoreFromWdl(wdl);
+
+    int from = flip_sq(static_cast<int>(TB_GET_FROM(tbRes)));
+    int to = flip_sq(static_cast<int>(TB_GET_TO(tbRes)));
+
+    Piece moved = from < 64 ? b.pieceAt(from) : EMPTY;
+    Piece captured = to < 64 ? b.pieceAt(to) : EMPTY;
+
+    bool wasEnPassant = TB_GET_EP(tbRes) != 0;
+    if (wasEnPassant) {
+        captured = b.isWhiteTurn ? BP : WP;
     }
 
-    // Decode move from tbRes
-    unsigned raw_from = TB_GET_FROM(tbRes);
-    unsigned raw_to = TB_GET_TO(tbRes);
-
-    int from = flip_sq(raw_from);   // convert to your indexing
-    int to = flip_sq(raw_to);
-
-    unsigned prom = TB_GET_PROMOTES(tbRes); // TB_PROMOTES_*
-
-    Piece moved = EMPTY;
-    Piece captured = EMPTY;
-
-    if (from < 64)
-        moved = b.pieceAt(from);
-    if (to < 64)
-        captured = b.pieceAt(to);
-
-    // Map promotion flag to your Piece enum
     Piece promoPiece = EMPTY;
-    if (prom != TB_PROMOTES_NONE) {
-        bool whiteToMove = b.isWhiteTurn;
-        switch (prom) {
-        case TB_PROMOTES_QUEEN:
-            promoPiece = whiteToMove ? WQ : BQ;
-            break;
-        case TB_PROMOTES_ROOK:
-            promoPiece = whiteToMove ? WR : BR;
-            break;
-        case TB_PROMOTES_BISHOP:
-            promoPiece = whiteToMove ? WB : BB;
-            break;
-        case TB_PROMOTES_KNIGHT:
-            promoPiece = whiteToMove ? WN : BN;
-            break;
-        default:
-            promoPiece = EMPTY;
-            break;
-        }
+    switch (TB_GET_PROMOTES(tbRes)) {
+    case TB_PROMOTES_QUEEN:
+        promoPiece = b.isWhiteTurn ? WQ : BQ;
+        break;
+    case TB_PROMOTES_ROOK:
+        promoPiece = b.isWhiteTurn ? WR : BR;
+        break;
+    case TB_PROMOTES_BISHOP:
+        promoPiece = b.isWhiteTurn ? WB : BB;
+        break;
+    case TB_PROMOTES_KNIGHT:
+        promoPiece = b.isWhiteTurn ? WN : BN;
+        break;
+    default:
+        break;
     }
 
     Move best(from, to, moved, captured, b.castleRights);
+    best.wasEnPassant = wasEnPassant;
     if (promoPiece != EMPTY) {
         best.wasPromotion = true;
         best.promotedTo = promoPiece;
     }
 
     outBestMove = best;
-    outScore = score;
+
+    std::ostringstream log;
+    log << "syzygy root DTZ probe hit: " << pieceCount
+        << " pieces wdl=" << wdlName(wdl)
+        << " dtz=" << TB_GET_DTZ(tbRes)
+        << " score=" << outScore;
+    syzygyLog(log.str());
     return true;
 }
