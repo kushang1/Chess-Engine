@@ -304,10 +304,14 @@ UciLoop::GoCommand UciLoop::parseGo(const std::vector<std::string>& tokens) cons
                     break;
                 }
                 ++i;
+                command.searchMoves.push_back(tokens[i]);
             }
         }
-        else if ((token == "nodes" || token == "mate") && i + 1 < static_cast<int>(tokens.size())) {
-            ++i;
+        else if (token == "nodes" && i + 1 < static_cast<int>(tokens.size())) {
+            command.nodeLimit = std::max(1LL, parseLongLong(tokens[++i], command.nodeLimit));
+        }
+        else if (token == "mate" && i + 1 < static_cast<int>(tokens.size())) {
+            command.mateMoves = std::max(1, parseInt(tokens[++i], command.mateMoves));
         }
     }
 
@@ -318,6 +322,26 @@ chess::SearchLimits UciLoop::makeSearchLimits(const GoCommand& command) const
 {
     chess::SearchLimits limits;
     limits.maxDepth = command.depth;
+    limits.nodeLimit = command.nodeLimit;
+    limits.mateMoves = command.mateMoves;
+
+    if (command.mateMoves > 0) {
+        // This is a bounded normal search to the mate horizon. It is not a
+        // specialized proof-number mate solver, but it honors UCI's limit
+        // instead of silently ignoring it.
+        limits.maxDepth = std::min(limits.maxDepth, command.mateMoves * 2 - 1);
+    }
+
+    if (!command.searchMoves.empty()) {
+        std::vector<Move> legalMoves = engine.legalMoves();
+        for (const Move& move : legalMoves) {
+            std::string text = moveToLongAlgebraic(move);
+            if (std::find(command.searchMoves.begin(), command.searchMoves.end(), text) !=
+                command.searchMoves.end()) {
+                limits.searchMoves.push_back(move);
+            }
+        }
+    }
 
     if (command.infinite) {
         limits.moveTimeMs = InfiniteMoveTimeMs;
@@ -451,6 +475,18 @@ int UciLoop::parseInt(const std::string& text, int fallback)
     try {
         std::size_t parsed = 0;
         int value = std::stoi(text, &parsed);
+        return parsed == text.size() ? value : fallback;
+    }
+    catch (...) {
+        return fallback;
+    }
+}
+
+long long UciLoop::parseLongLong(const std::string& text, long long fallback)
+{
+    try {
+        std::size_t parsed = 0;
+        long long value = std::stoll(text, &parsed);
         return parsed == text.size() ? value : fallback;
     }
     catch (...) {

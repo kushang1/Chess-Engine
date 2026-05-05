@@ -271,6 +271,7 @@ SearchResult ChessEngine::findBestMove(const SearchLimits& limits, const std::ve
 {
     SearchResult result;
     impl->searcher.setTimeLimitMs(limits.moveTimeMs);
+    impl->searcher.setNodeLimit(limits.nodeLimit);
     impl->searcher.resetSearchStats();
 
     std::vector<uint64_t> repetitions = repetitionHistory;
@@ -279,7 +280,8 @@ SearchResult ChessEngine::findBestMove(const SearchLimits& limits, const std::ve
     }
 
     auto start = std::chrono::steady_clock::now();
-    result.bestMove = impl->searcher.findBestMove(impl->position, limits.maxDepth, repetitions);
+    result.bestMove = impl->searcher.findBestMove(
+        impl->position, limits.maxDepth, repetitions, limits.searchMoves);
     auto end = std::chrono::steady_clock::now();
 
     result.nodes = impl->searcher.nodesSearched();

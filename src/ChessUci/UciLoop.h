@@ -23,6 +23,9 @@ private:
         int whiteIncrementMs = 0;
         int blackIncrementMs = 0;
         int movesToGo = 30;
+        long long nodeLimit = 0;
+        int mateMoves = 0;
+        std::vector<std::string> searchMoves;
         bool infinite = false;
         bool perft = false;
         int perftDepth = 0;
@@ -48,6 +51,7 @@ private:
     static std::vector<std::string> split(const std::string& line);
     static std::string joinTokens(const std::vector<std::string>& tokens, int first, int last);
     static int parseInt(const std::string& text, int fallback);
+    static long long parseLongLong(const std::string& text, long long fallback);
 
     chess::ChessEngine engine;
     std::vector<uint64_t> repetitionHistory;

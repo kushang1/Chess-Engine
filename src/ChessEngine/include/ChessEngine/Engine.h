@@ -18,7 +18,8 @@ public:
 
 	int maxDepth = 128;
     Move findBestMove(board& b, int depth,
-        const std::vector<uint64_t>& globalReps);
+        const std::vector<uint64_t>& globalReps,
+        const std::vector<Move>& rootMoveFilter);
     MoveGenerator* moveGenerator;
     Engine();
     ~Engine(); 
@@ -26,6 +27,7 @@ public:
     long long leafNodesSearched() const;
     void resetSearchStats();
     void setTimeLimitMs(int milliseconds);
+    void setNodeLimit(long long nodes);
     void setHashSizeMb(int megabytes);
     void clearStop();
     void requestStop();
@@ -37,13 +39,14 @@ private:
     int historyHeuristic[2][64][64];
 
 
-    int search(board& b, int depth, int alpha, int beta,
-        std::vector<uint64_t>& repHistory);
+    int search(board& b, int depth, int alpha, int beta, int ply,
+        std::vector<uint64_t>& repHistory, bool pvNode, int extensionCount);
 
     int scoreMove(const Move& m, const board& b, int ply,
         bool haveTTMove, const Move& ttMove);
 
-    int quiescence(board& b, int alpha, int beta);
+    int quiescence(board& b, int alpha, int beta, int ply, int qply,
+        std::vector<uint64_t>& repHistory);
 
 	std::unordered_map<uint64_t, int> repTable;
 
@@ -72,10 +75,14 @@ private:
     uint64_t ttMask = 0;
 
     void resizeTranspositionTable(int megabytes);
+    int scoreToTT(int score, int ply) const;
+    int scoreFromTT(int score, int ply) const;
+    bool shouldStop();
 
     std::atomic<bool> stopSearch;
     std::chrono::steady_clock::time_point searchStart;
     int timeLimitMs = 1000;  // default: 5 seconds per move
+    long long nodeLimit = 0;
 
     std::vector<PolyglotEntry> openingBook;
     bool externalDataInitialized = false;

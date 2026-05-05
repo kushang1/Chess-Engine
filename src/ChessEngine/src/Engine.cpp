@@ -374,6 +374,11 @@ void Engine::setTimeLimitMs(int milliseconds)
 	timeLimitMs = std::max(1, milliseconds);
 }
 
+void Engine::setNodeLimit(long long nodes)
+{
+	nodeLimit = std::max(0LL, nodes);
+}
+
 void Engine::setHashSizeMb(int megabytes)
 {
 	resizeTranspositionTable(megabytes);
@@ -420,10 +425,113 @@ long long Engine::leafNodesSearched() const
 	return leafNodes.load(std::memory_order_relaxed);
 }
 
+int Engine::scoreToTT(int score, int ply) const
+{
+	if (score >= MATE_THRESHOLD) {
+		return score + ply;
+	}
+	if (score <= -MATE_THRESHOLD) {
+		return score - ply;
+	}
+	return score;
+}
+
+int Engine::scoreFromTT(int score, int ply) const
+{
+	if (score >= MATE_THRESHOLD) {
+		return score - ply;
+	}
+	if (score <= -MATE_THRESHOLD) {
+		return score + ply;
+	}
+	return score;
+}
+
+bool Engine::shouldStop()
+{
+	if (stopSearch.load(std::memory_order_relaxed)) {
+		return true;
+	}
+
+	if (nodeLimit > 0 &&
+		totalNodes.load(std::memory_order_relaxed) >= nodeLimit) {
+		stopSearch.store(true, std::memory_order_relaxed);
+		return true;
+	}
+
+	long long nodes = totalNodes.load(std::memory_order_relaxed);
+	if ((nodes & 0x0FFF) == 0) {
+		auto now = std::chrono::steady_clock::now();
+		auto elapsedMs =
+			std::chrono::duration_cast<std::chrono::milliseconds>(now - searchStart).count();
+		if (elapsedMs >= timeLimitMs) {
+			stopSearch.store(true, std::memory_order_relaxed);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static const int pieceValueSimple[13] = {
 	0, 9, 5, 1, 3, 100, 3,
 	   9, 5, 1, 3, 100, 3
 };
+
+static int pieceValueCp(Piece p)
+{
+	switch (p) {
+	case WP: case BP: return 100;
+	case WN: case BN: return 320;
+	case WB: case BB: return 330;
+	case WR: case BR: return 500;
+	case WQ: case BQ: return 900;
+	case WK: case BK: return 20000;
+	default: return 0;
+	}
+}
+
+static int promotionGainCp(const Move& m)
+{
+	return m.wasPromotion ? pieceValueCp(m.promotedTo) - pieceValueCp(m.moved) : 0;
+}
+
+static bool isQuietMove(const Move& m)
+{
+	return m.captured == EMPTY && !m.wasEnPassant && !m.wasPromotion;
+}
+
+static int approximateSee(const board& b, MoveGenerator* generator, const Move& move)
+{
+	if (move.captured == EMPTY && !move.wasEnPassant) {
+		return promotionGainCp(move);
+	}
+
+	int gain = pieceValueCp(move.captured) + promotionGainCp(move);
+	board after = b;
+	after.makeMove(move);
+
+	MoveList replies;
+	generator->generateLegalMoves(after, replies);
+
+	int leastRecapture = 0;
+	for (const Move& reply : replies) {
+		if (reply.to != move.to) {
+			continue;
+		}
+
+		int value = pieceValueCp(reply.moved);
+		if (leastRecapture == 0 || value < leastRecapture) {
+			leastRecapture = value;
+		}
+	}
+
+	if (leastRecapture != 0) {
+		gain -= pieceValueCp(move.wasPromotion ? move.promotedTo : move.moved);
+	}
+
+	return gain;
+}
 
 
 
@@ -547,11 +655,20 @@ int Engine::scoreMove(const Move& m, const board& b, int ply,
 		return 1000000;
 	}
 
-	// 2. MVV-LVA captures before quiet moves.
+	if (m.wasPromotion) {
+		return 850000 + pieceValueCp(m.promotedTo) + (m.captured != EMPTY ? pieceValueCp(m.captured) : 0);
+	}
+
+	// 2. Winning/equal captures are searched before quiet moves; losing
+	// captures are delayed so quiet refutations are not buried behind MVV-LVA.
 	if (m.captured != EMPTY) {
+		int see = approximateSee(b, moveGenerator, m);
 		int victim = pieceValueSimple[m.captured];
 		int attacker = pieceValueSimple[m.moved];
-		return 500000 + (victim * 100 - attacker);
+		if (see >= 0) {
+			return 650000 + see + (victim * 100 - attacker);
+		}
+		return 150000 + see + (victim * 100 - attacker);
 	}
 
 	// 3. Killer moves are quiet beta-cutoff moves from the same ply.
@@ -563,7 +680,7 @@ int Engine::scoreMove(const Move& m, const board& b, int ply,
 
 	// 4. Quiet moves use side-aware history scores.
 	int side = b.isWhiteTurn ? 0 : 1;
-	return historyHeuristic[side][m.from][m.to];
+	return std::clamp(historyHeuristic[side][m.from][m.to], -200000, 350000);
 }
 
 // ==========================================================
@@ -843,7 +960,8 @@ static void selectBestScoredMove(Move* moves, int* scores, int index, int count)
 
 
 Move Engine::findBestMove(board& b, int maxDepth,
-	const std::vector<uint64_t>& globalReps)
+	const std::vector<uint64_t>& globalReps,
+	const std::vector<Move>& rootMoveFilter)
 {
 	resetSearchStats();
 	
@@ -852,14 +970,8 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	this->maxDepth = maxDepth;
 	const bool emitUciInfo = uciInfoOutputEnabled();
 
-	Move bookMove = probeBook(b);
-	if (bookMove.from != -1)
-	{
-		return bookMove;
-	}
-
 	// --------------------------------------------
-	// 5 second search time
+	// Search start time and repetition root.
 	// --------------------------------------------
 	searchStart = std::chrono::steady_clock::now();
 
@@ -872,18 +984,42 @@ Move Engine::findBestMove(board& b, int maxDepth,
 		repHistory.push_back(currentKey);
 	}
 
-	// --------------------------------------------
-	// Root move generation
-	// --------------------------------------------
 	auto rootMoves = moveGenerator->generateLegalMoves(b);
+	if (!rootMoveFilter.empty()) {
+		std::vector<Move> filtered;
+		filtered.reserve(rootMoveFilter.size());
+		for (const Move& legal : rootMoves) {
+			for (const Move& requested : rootMoveFilter) {
+				if (sameMoveIdentity(legal, requested)) {
+					filtered.push_back(legal);
+					break;
+				}
+			}
+		}
+
+		if (!filtered.empty()) {
+			rootMoves = std::move(filtered);
+		}
+	}
+
+	if (rootMoves.empty()) {
+		return Move(-1, -1, EMPTY, EMPTY, 0);
+	}
+
+	if (rootMoveFilter.empty()) {
+		Move bookMove = probeBook(b);
+		if (bookMove.from != -1) {
+			Move legalBookMove;
+			if (findLegalEquivalent(rootMoves, bookMove, legalBookMove)) {
+				return legalBookMove;
+			}
+		}
+	}
 
 	if(rootMoves.size() == 1)
 	{
 		return rootMoves[0];
 	}
-
-	if (rootMoves.empty())
-		return Move(-1, -1, EMPTY, EMPTY, 0);
 
 	if (syzygyIsAvailable()) {
 		int tbScore = 0;
@@ -899,6 +1035,129 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	Move bestFullMove = rootMoves[0];
 	int  bestFullScore = -INF;
 	bool haveFull = false;
+	Move bestSafeMove = rootMoves[0];
+	int bestSafeScore = -INF;
+	bool haveSafe = false;
+
+	struct RootSearchResult {
+		Move move;
+		int score = -INF;
+		int completedDepth = 0;
+		bool fullySearched = false;
+		bool aborted = false;
+	};
+
+	struct RootIterationResult {
+		std::vector<RootSearchResult> results;
+		Move bestMove;
+		int bestScore = -INF;
+		bool anyCompleted = false;
+		bool completedAll = false;
+		bool stopped = false;
+		bool betaCutoff = false;
+	};
+
+	auto rememberSafeMove = [&](const RootIterationResult& result) {
+		if (result.anyCompleted &&
+			(!haveSafe || result.bestScore > bestSafeScore)) {
+			bestSafeMove = result.bestMove;
+			bestSafeScore = result.bestScore;
+			haveSafe = true;
+		}
+		};
+
+	auto searchRootMoves = [&](int depth, int rootAlpha, int rootBeta) {
+		RootIterationResult result;
+		result.results.resize(rootMoves.size());
+		result.bestMove = rootMoves[0];
+
+		int alpha = rootAlpha;
+		bool firstMove = true;
+
+		for (size_t i = 0; i < rootMoves.size(); ++i) {
+			RootSearchResult& entry = result.results[i];
+			entry.move = rootMoves[i];
+			entry.completedDepth = depth;
+
+			if (shouldStop()) {
+				entry.aborted = true;
+				result.stopped = true;
+				break;
+			}
+
+			Move rm = rootMoves[i];
+			board local = b;
+			std::vector<uint64_t> localRepHistory = repHistory;
+			local.makeMove(rm);
+
+			const int childDepth = depth - 1;
+			int childScore = 0;
+			int score = -INF;
+
+			if (firstMove) {
+				childScore = search(local, childDepth, -rootBeta, -alpha,
+					1, localRepHistory, true, 0);
+				if (isSearchAborted(childScore)) {
+					entry.aborted = true;
+					result.stopped = true;
+					break;
+				}
+				score = -childScore;
+			}
+			else {
+				childScore = search(local, childDepth, -alpha - 1, -alpha,
+					1, localRepHistory, false, 0);
+				if (isSearchAborted(childScore)) {
+					entry.aborted = true;
+					result.stopped = true;
+					break;
+				}
+				score = -childScore;
+
+				if (score > alpha && score < rootBeta) {
+					childScore = search(local, childDepth, -rootBeta, -alpha,
+						1, localRepHistory, true, 0);
+					if (isSearchAborted(childScore)) {
+						entry.aborted = true;
+						result.stopped = true;
+						break;
+					}
+					score = -childScore;
+				}
+			}
+
+			if (shouldStop()) {
+				entry.aborted = true;
+				result.stopped = true;
+				break;
+			}
+
+			entry.score = score;
+			entry.fullySearched = true;
+			result.anyCompleted = true;
+			firstMove = false;
+
+			if (score > result.bestScore) {
+				result.bestScore = score;
+				result.bestMove = rm;
+			}
+
+			if (score > alpha) {
+				alpha = score;
+			}
+
+			if (alpha >= rootBeta) {
+				result.betaCutoff = true;
+				break;
+			}
+		}
+
+		result.completedAll =
+			result.anyCompleted &&
+			!result.stopped &&
+			!result.betaCutoff;
+		return result;
+		};
 
 	// --------------------------------------------
 	// Iterative deepening loop
@@ -928,94 +1187,52 @@ Move Engine::findBestMove(board& b, int maxDepth,
 				std::swap(rootMoves[0], *it);
 		}
 
-		struct RootSearchResult { Move move; int score; bool full; };
-		std::vector<RootSearchResult> results(rootMoves.size());
+		constexpr int InitialAspirationWindow = 50;
+		constexpr int MaxAspirationAttempts = 6;
 
-		int bestDepthScore = -INF;
-		Move bestDepthMove = rootMoves[0];
-		bool anyFullThisDepth = false;
-
-		auto collectRootResults = [&]() {
-			bestDepthScore = -INF;
-			bestDepthMove = rootMoves[0];
-			anyFullThisDepth = false;
-
-			for (auto& r : results)
-			{
-				if (r.full)
-				{
-					if (!anyFullThisDepth || r.score > bestDepthScore)
-					{
-						anyFullThisDepth = true;
-						bestDepthScore = r.score;
-						bestDepthMove = r.move;
-					}
-				}
-			}
-			};
-
-		auto searchRootMoves = [&](int rootAlpha, int rootBeta) {
-			for (auto& r : results) {
-				r = { Move(), -INF, false };
-			}
-
-			// Search root moves serially for tournament stability.
-			for (size_t i = 0; i < rootMoves.size(); i++)
-			{
-				if (stopSearch.load(std::memory_order_relaxed)) {
-					results[i] = { rootMoves[i], -INF, false };
-					return false;
-				}
-
-				Move rm = rootMoves[i];
-				board local = b;
-				std::vector<uint64_t> localRepHistory = repHistory;
-
-				Unmove u = local.makeMove(rm);
-				(void)u;
-
-				bool fullEval = true;
-				int childScore = search(local, depth - 1, -rootBeta, -rootAlpha, localRepHistory);
-				int score = -INF;
-				if (isSearchAborted(childScore)) {
-					results[i] = { rm, -INF, false };
-					return false;
-				}
-				else {
-					score = -childScore;
-				}
-
-				if (stopSearch.load(std::memory_order_relaxed))
-					fullEval = false;
-
-				results[i] = { rm, score, fullEval };
-			}
-
-			return true;
-			};
-
-		constexpr int AspirationWindow = 50;
 		int rootAlpha = -INF;
 		int rootBeta = INF;
-		bool usedAspiration = false;
+		int delta = InitialAspirationWindow;
+		bool depthCompleted = false;
+		RootIterationResult lastAttempt;
 
 		if (depth > 1 && haveFull) {
-			rootAlpha = std::max(-INF, bestFullScore - AspirationWindow);
-			rootBeta = std::min(INF, bestFullScore + AspirationWindow);
-			usedAspiration = true;
+			rootAlpha = std::max(-INF, bestFullScore - delta);
+			rootBeta = std::min(INF, bestFullScore + delta);
 		}
 
-		searchRootMoves(rootAlpha, rootBeta);
-		collectRootResults();
+		for (int attempt = 0; attempt < MaxAspirationAttempts; ++attempt) {
+			lastAttempt = searchRootMoves(depth, rootAlpha, rootBeta);
+			rememberSafeMove(lastAttempt);
 
-		if (usedAspiration &&
-			!stopSearch.load(std::memory_order_relaxed) &&
-			anyFullThisDepth &&
-			(bestDepthScore <= rootAlpha || bestDepthScore >= rootBeta))
-		{
-			// One stable fallback to full window on aspiration fail-low/high.
-			searchRootMoves(-INF, INF);
-			collectRootResults();
+			if (lastAttempt.stopped) {
+				break;
+			}
+
+			if (lastAttempt.completedAll &&
+				lastAttempt.bestScore > rootAlpha &&
+				lastAttempt.bestScore < rootBeta) {
+				depthCompleted = true;
+				break;
+			}
+
+			if (rootAlpha == -INF && rootBeta == INF) {
+				depthCompleted = lastAttempt.completedAll;
+				break;
+			}
+
+			if (lastAttempt.completedAll && lastAttempt.bestScore <= rootAlpha) {
+				rootAlpha = std::max(-INF, rootAlpha - delta);
+			}
+			else {
+				rootBeta = std::min(INF, rootBeta + delta);
+			}
+
+			delta *= 2;
+			if (attempt == MaxAspirationAttempts - 2) {
+				rootAlpha = -INF;
+				rootBeta = INF;
+			}
 		}
 
 		now = std::chrono::steady_clock::now();
@@ -1024,79 +1241,59 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 		bool timedOut = elapsed >= timeLimitMs || stopSearch.load();
 
-		if (!timedOut)
+		if (!timedOut && depthCompleted)
 		{
-			if (anyFullThisDepth)
-			{
-				bestFullMove = bestDepthMove;
-				bestFullScore = bestDepthScore;
-				haveFull = true;
+			bestFullMove = lastAttempt.bestMove;
+			bestFullScore = lastAttempt.bestScore;
+			haveFull = true;
+			bestSafeMove = bestFullMove;
+			bestSafeScore = bestFullScore;
+			haveSafe = true;
 
-				if (emitUciInfo) {
-					// Emit only after a fully completed root depth; never from node loops.
-					emitCompletedDepthInfo(depth, bestFullScore, bestFullMove, searchStart);
-				}
-			}
-			else {
+			if (emitUciInfo) {
+				// Emit only after a fully completed root depth; never from node loops.
+				emitCompletedDepthInfo(depth, bestFullScore, bestFullMove, searchStart);
 			}
 			continue;
 		}
 
 		// --------------------------------------------
-		// Timeout happened
+		// Timeout/stop or incomplete aspiration. Keep the last completed
+		// iteration as the baseline, but allow a fully searched root move from
+		// this partial depth to replace it when its score is safely better.
 		// --------------------------------------------
-
-		if (!anyFullThisDepth)
-		{
-			break;
-		}
-
-		if (!haveFull || bestDepthScore > bestFullScore)
-		{
-			bestFullMove = bestDepthMove;
-			bestFullScore = bestDepthScore;
+		if (!haveFull && haveSafe) {
+			bestFullMove = bestSafeMove;
+			bestFullScore = bestSafeScore;
 			haveFull = true;
-
 		}
-		else
-		{
+		else if (haveFull && haveSafe && bestSafeScore > bestFullScore) {
+			bestFullMove = bestSafeMove;
+			bestFullScore = bestSafeScore;
 		}
 
 		break;
 	}
 
 
-	return bestFullMove;
+	if (haveFull) {
+		return bestFullMove;
+	}
+	if (haveSafe) {
+		return bestSafeMove;
+	}
+	return rootMoves[0];
 }
 
 
-int Engine::search(board& b, int depth, int alpha, int beta,
-	std::vector<uint64_t>& repHistory)
+int Engine::search(board& b, int depth, int alpha, int beta, int ply,
+	std::vector<uint64_t>& repHistory, bool pvNode, int extensionCount)
 {
 	depth = std::clamp(depth, 0, MAX_DEPTH - 1);
+	const int tablePly = std::clamp(ply, 0, MAX_DEPTH - 1);
 	totalNodes++;
-	auto fix_mate_score = [&](int s, int ply) {
-		if (s > MATE_THRESHOLD)     return s - ply;
-		if (s < -MATE_THRESHOLD)    return s + ply;
-		return s;
-		};
 
-	// --------------------------------------------------
-	// Time control: periodically check if time is up
-	// --------------------------------------------------
-	if ((totalNodes & 0x0FFF) == 0) { // check every ~4K nodes
-		if (!stopSearch.load(std::memory_order_relaxed)) {
-			auto now = std::chrono::steady_clock::now();
-			auto elapsedMs =
-				std::chrono::duration_cast<std::chrono::milliseconds>(now - searchStart).count();
-			if (elapsedMs >= timeLimitMs) {
-				stopSearch.store(true, std::memory_order_relaxed);
-			}
-		}
-	}
-
-	if (stopSearch.load(std::memory_order_relaxed)) {
-		
+	if (shouldStop()) {
 		return SEARCH_ABORTED;
 	}
 
@@ -1120,39 +1317,37 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		}
 	}
 
-	RepetitionFrame repetitionFrame(repHistory, key);
-	
-
 	// Leaf ? quiescence search
 	if (depth == 0) {
 		leafNodes++;
-		return quiescence(b, alpha, beta);
+		return quiescence(b, alpha, beta, ply, 0, repHistory);
 	}
 
+	RepetitionFrame repetitionFrame(repHistory, key);
 	int alphaOrig = alpha;
 
 	// -------------------------------
 	// TRANSPOSITION TABLE PROBE
 	// -------------------------------
-	TTEntry& entry = tt[key & ttMask];
+	TTEntry* entry = (tt != nullptr && ttSize != 0) ? &tt[key & ttMask] : nullptr;
 
 	Move ttMove;
 	bool haveTTMove = false;
 
-	if (entry.flag != TT_EMPTY && entry.key == key)
+	if (entry != nullptr && entry->flag != TT_EMPTY && entry->key == key)
 	{
 		// Always keep the stored best move for ordering, even from shallow entries.
-		ttMove = entry.bestMove;
+		ttMove = entry->bestMove;
 		haveTTMove = ttMove.from != -1 && ttMove.to != -1;
 
-		if (entry.depth >= depth) {
-			int stored = entry.score;
+		if (entry->depth >= depth) {
+			int stored = scoreFromTT(entry->score, ply);
 
-			if (entry.flag == TT_EXACT)
+			if (entry->flag == TT_EXACT)
 				return stored;
-			else if (entry.flag == TT_ALPHA && stored <= alpha)
+			else if (entry->flag == TT_ALPHA && stored <= alpha)
 				return stored;
-			else if (entry.flag == TT_BETA && stored >= beta)
+			else if (entry->flag == TT_BETA && stored >= beta)
 				return stored;
 		}
 
@@ -1169,12 +1364,14 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		Move tbMove;
 		if (totalPieces <= (int)TB_LARGEST && probeSyzygy(b, tbScore, tbMove)) {
 
-			TTEntry& tbEntry = tt[key & ttMask];
-			tbEntry.key = key;
-			tbEntry.score = tbScore;
-			tbEntry.depth = 127;     // highest possible depth
-			tbEntry.flag = TT_EXACT;
-			tbEntry.bestMove = tbMove;
+			if (tt != nullptr && ttSize != 0) {
+				TTEntry& tbEntry = tt[key & ttMask];
+				tbEntry.key = key;
+				tbEntry.score = scoreToTT(tbScore, ply);
+				tbEntry.depth = 127;     // highest possible depth
+				tbEntry.flag = TT_EXACT;
+				tbEntry.bestMove = tbMove;
+			}
 
 			return tbScore;
 		}
@@ -1197,7 +1394,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	//  - depth high enough (depth >= 3)
 	//  - not in check
 	//  - side to move has some non-pawn material (avoid zugzwang-ish endings)
-	if (depth >= 3 && !inCheck) {
+	if (!pvNode && depth >= 3 && !inCheck) {
 		bool hasNonPawnMaterial = false;
 
 		if (b.isWhiteTurn) {
@@ -1212,6 +1409,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		}
 
 		if (hasNonPawnMaterial) {
+			int staticEval = evaluate(b);
 			// Save state we touch
 			bool prevTurn = b.isWhiteTurn;
 			bool prevHasEP = b.hasEnPassant;
@@ -1229,10 +1427,14 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			b.enPassantSquare = -1;
 			b.hash ^= ZobristData::sideToMove(b.isWhiteTurn);
 
-			const int R = 2; // depth reduction
+			int R = 2 + depth / 6;
+			if (staticEval >= beta + 200) {
+				++R;
+			}
+			R = std::min(R, depth - 1);
 			int childScore = search(b, depth - 1 - R,
 				-beta, -beta + 1,
-				repHistory);
+				ply + 1, repHistory, false, extensionCount);
 
 			// Undo null move
 			b.isWhiteTurn = prevTurn;
@@ -1262,7 +1464,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	if (moves.count == 0) {
 		// we already have inCheck from above
 		if (inCheck) {
-			return -(MATE_SCORE - (maxDepth - depth));
+			return -MATE_SCORE + ply;
 		}
 		else {
 			return 0; // stalemate
@@ -1272,21 +1474,22 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	// Score and order moves
 	int scores[MoveList::MAX_MOVES];
 	Move* moveData = moves.data();
-	int ply = std::clamp(maxDepth - depth, 0, MAX_DEPTH - 1);
 
 	for (int i = 0; i < moves.count; ++i)
 	{
 		Move& m = moveData[i];
-		scores[i] = scoreMove(m, b, ply, haveTTMove, ttMove);
+		scores[i] = scoreMove(m, b, tablePly, haveTTMove, ttMove);
 	}
 
 	int besteval = -INF;
 	Move bestMoveLocal;
+	bool selectivelyPruned = false;
 
 	// -------------------------------
 	// SEARCH CHILD MOVES
 	// -------------------------------
 	int moveIndex = 0;
+	int searchedMoves = 0;
 	bool firstMove = true;
 
 	for (int orderedIndex = 0; orderedIndex < moves.count; ++orderedIndex) {
@@ -1295,7 +1498,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 
 		Unmove u = b.makeMove(move);
 
-		bool isCapture = (move.captured != EMPTY);
+		bool isCapture = (move.captured != EMPTY) || move.wasEnPassant;
 
 		// ---------------------------------------
 		// CHECK EXTENSION: does this move give check?
@@ -1314,13 +1517,18 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		}
 
 		bool isKiller =
-			sameMoveIdentity(killerMoves[ply][0], move) ||
-			sameMoveIdentity(killerMoves[ply][1], move);
+			sameMoveIdentity(killerMoves[tablePly][0], move) ||
+			sameMoveIdentity(killerMoves[tablePly][1], move);
 
 		// Base depth for this move: one ply less
 		int newDepth = depth - 1;
-		if (givesCheck) {
-			// Extend checks by 1 ply
+		int extension = 0;
+		if (extensionCount < 1 &&
+			((inCheck && depth <= 6) ||
+			(givesCheck && (isCapture || move.wasPromotion || depth <= 4)))) {
+			extension = 1;
+		}
+		if (extension != 0) {
 			newDepth++;
 		}
 
@@ -1329,13 +1537,20 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 
 
 		if (!isCapture &&
+			!move.wasPromotion &&
 			!givesCheck &&
 			!inCheck &&
+			!pvNode &&
 			depth <= 3 &&
 			moveIndex >= 6 &&
+			searchedMoves > 0 &&
 			!isTTMove &&
-			!isKiller)
+			!isKiller &&
+			historyHeuristic[b.isWhiteTurn ? 0 : 1][move.from][move.to] < 12000)
 		{
+			// LMP is forward pruning. Once a legal move is skipped, this node
+			// must not be stored as a fully searched TT bound.
+			selectivelyPruned = true;
 			b.unmakeMove(move, u);
 			moveIndex++;
 			continue;
@@ -1355,36 +1570,44 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		if (newDepth > 0 &&
 			depth >= 3 &&
 			moveIndex >= 3 &&
-			!isCapture &&
+			isQuietMove(move) &&
+			!pvNode &&
 			!inCheck &&
-			!givesCheck)
+			!givesCheck &&
+			!isTTMove &&
+			!isKiller)
 		{
-			int R = 1;  // reduction (tuneable, try 1 or 2)
+			int R = 1;
+			if (depth >= 6 && moveIndex >= 6) {
+				++R;
+			}
+			if (historyHeuristic[b.isWhiteTurn ? 0 : 1][move.from][move.to] < 0) {
+				++R;
+			}
+			R = std::min(R, newDepth - 1);
 
 			// Reduced-depth search with null window
 			int childScore = search(b, newDepth - R,
 				-alpha - 1, -alpha,
-				repHistory);
+				ply + 1, repHistory, false, extensionCount + extension);
 			if (isSearchAborted(childScore)) {
 				b.unmakeMove(move, u);
 				return SEARCH_ABORTED;
 			}
 
 			eval = -childScore;
-			eval = fix_mate_score(eval, 1);
 
 			// If it looks better than alpha, research at full depth
 			if (eval > alpha) {
 				childScore = search(b, newDepth,
 					-beta, -alpha,
-					repHistory);
+					ply + 1, repHistory, pvNode, extensionCount + extension);
 				if (isSearchAborted(childScore)) {
 					b.unmakeMove(move, u);
 					return SEARCH_ABORTED;
 				}
 
 				eval = -childScore;
-				eval = fix_mate_score(eval, 1);
 			}
 		}
 		else {
@@ -1393,44 +1616,42 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 				// PVS: late moves get a null-window probe before a full re-search.
 				childScore = search(b, newDepth,
 					-alpha - 1, -alpha,
-					repHistory);
+					ply + 1, repHistory, false, extensionCount + extension);
 				if (isSearchAborted(childScore)) {
 					b.unmakeMove(move, u);
 					return SEARCH_ABORTED;
 				}
 
 				eval = -childScore;
-				eval = fix_mate_score(eval, 1);
 
-				if (eval > alpha) {
+				if (eval > alpha && eval < beta) {
 					childScore = search(b, newDepth,
 						-beta, -alpha,
-						repHistory);
+						ply + 1, repHistory, pvNode, extensionCount + extension);
 					if (isSearchAborted(childScore)) {
 						b.unmakeMove(move, u);
 						return SEARCH_ABORTED;
 					}
 
 					eval = -childScore;
-					eval = fix_mate_score(eval, 1);
 				}
 			}
 			else {
 				// First move, check nodes, and shallow nodes keep the full window.
 				childScore = search(b, newDepth,
 					-beta, -alpha,
-					repHistory);
+					ply + 1, repHistory, pvNode && firstMove, extensionCount + extension);
 				if (isSearchAborted(childScore)) {
 					b.unmakeMove(move, u);
 					return SEARCH_ABORTED;
 				}
 
 				eval = -childScore;
-				eval = fix_mate_score(eval, 1);
 			}
 		}
 		
 		firstMove = false;
+		++searchedMoves;
 		b.unmakeMove(move, u);
 
 		// ------------------------------
@@ -1447,14 +1668,15 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 
 		// Alpha–beta cutoff
 		if (alpha >= beta) {
-			if (!isCapture) {
+			if (isQuietMove(move)) {
 				// Quiet beta cutoffs update killer and side-aware history tables.
-				if (!sameMoveIdentity(killerMoves[ply][0], move)) {
-					killerMoves[ply][1] = killerMoves[ply][0];
-					killerMoves[ply][0] = move;
+				if (!sameMoveIdentity(killerMoves[tablePly][0], move)) {
+					killerMoves[tablePly][1] = killerMoves[tablePly][0];
+					killerMoves[tablePly][0] = move;
 				}
 				int side = b.isWhiteTurn ? 0 : 1;
-				historyHeuristic[side][move.from][move.to] += depth * depth;
+				historyHeuristic[side][move.from][move.to] =
+					std::min(1000000, historyHeuristic[side][move.from][move.to] + depth * depth);
 			}
 			break;
 		}
@@ -1467,13 +1689,25 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		return SEARCH_ABORTED;
 	}
 
+	if (selectivelyPruned) {
+		return besteval;
+	}
+
 	// -----------------------------------
 	// STORE TT ENTRY
 	// Do not store partial results after a timeout/stop abort.
 	// -----------------------------------
+	if (tt == nullptr || ttSize == 0) {
+		return besteval;
+	}
+
 	TTEntry& store = tt[key & ttMask];
+	if (store.flag != TT_EMPTY && store.key != key && store.depth > depth + 2) {
+		return besteval;
+	}
+
 	store.key = key;
-	store.score = fix_mate_score(besteval, 0);
+	store.score = scoreToTT(besteval, ply);
 	store.depth = depth;
 
 	if (besteval <= alphaOrig)
@@ -1489,30 +1723,28 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 }
 
 
-int Engine::quiescence(board& b, int alpha, int beta)
+int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
+	std::vector<uint64_t>& repHistory)
 {
 	totalNodes++;  // still count these as nodes
-	auto fix_mate_score = [&](int s, int ply) {
-		if (s > MATE_THRESHOLD)     return s - ply;
-		if (s < -MATE_THRESHOLD)    return s + ply;
-		return s;
-		};
+	constexpr int MaxQSearchPly = 24;
+	constexpr int DeltaMargin = 150;
 
-
-	if ((totalNodes & 0x0FFF) == 0) {
-		if (!stopSearch.load(std::memory_order_relaxed)) {
-			auto now = std::chrono::steady_clock::now();
-			auto elapsedMs =
-				std::chrono::duration_cast<std::chrono::milliseconds>(now - searchStart).count();
-			if (elapsedMs >= timeLimitMs) {
-				stopSearch.store(true, std::memory_order_relaxed);
-			}
-		}
-	}
-
-	if (stopSearch.load(std::memory_order_relaxed)) {
+	if (shouldStop()) {
 		return SEARCH_ABORTED;
 	}
+
+	if (b.halfmoveClock >= 100) {
+		return 0;
+	}
+
+	uint64_t key = computeHash(b);
+	for (auto it = repHistory.rbegin(); it != repHistory.rend(); ++it) {
+		if (*it == key) {
+			return 0;
+		}
+	}
+	RepetitionFrame repetitionFrame(repHistory, key);
 
 	int kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
 	bool inCheck = kingSq != -1 &&
@@ -1521,19 +1753,24 @@ int Engine::quiescence(board& b, int alpha, int beta)
 	MoveList moves;
 	moveGenerator->generateLegalMoves(b, moves);
 
+	if (inCheck && moves.count == 0) {
+		return -MATE_SCORE + ply;
+	}
+
+	if (qply >= MaxQSearchPly) {
+		return evaluate(b);
+	}
+
 	int scores[MoveList::MAX_MOVES];
-	Move* moveData = moves.data();
+	Move qMoves[MoveList::MAX_MOVES];
 	int searchCount = 0;
 
 	if (inCheck) {
 		// Stand-pat is illegal while in check; search every legal evasion.
-		if (moves.count == 0) {
-			return -(MATE_SCORE - maxDepth);
-		}
-
 		searchCount = moves.count;
 		for (int i = 0; i < searchCount; ++i) {
-			scores[i] = scoreMove(moveData[i], b, MAX_DEPTH - 1, false, Move());
+			qMoves[i] = moves.data()[i];
+			scores[i] = scoreMove(qMoves[i], b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move());
 		}
 	}
 	else {
@@ -1547,11 +1784,26 @@ int Engine::quiescence(board& b, int alpha, int beta)
 		if (standPat > alpha)
 			alpha = standPat;
 
-		// Score only captures using MVV-LVA (depth 0 so killers/history are harmless)
+		const bool alphaIsNormal = alpha > -MATE_THRESHOLD && alpha < MATE_THRESHOLD;
 		for (auto& m : moves) {
-			if (m.captured == EMPTY) continue; // only captures in normal quiescence
-			moveData[searchCount] = m;
-			scores[searchCount] = scoreMove(m, b, MAX_DEPTH - 1, false, Move());
+			bool tactical = (m.captured != EMPTY) || m.wasEnPassant || m.wasPromotion;
+			if (!tactical) {
+				continue;
+			}
+
+			int gain = pieceValueCp(m.captured) + promotionGainCp(m);
+			if (!m.wasPromotion && alphaIsNormal &&
+				standPat + gain + DeltaMargin <= alpha) {
+				continue;
+			}
+
+			int see = approximateSee(b, moveGenerator, m);
+			if (!m.wasPromotion && see < -120) {
+				continue;
+			}
+
+			qMoves[searchCount] = m;
+			scores[searchCount] = scoreMove(m, b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move());
 			++searchCount;
 		}
 
@@ -1562,18 +1814,26 @@ int Engine::quiescence(board& b, int alpha, int beta)
 	}
 
 	for (int orderedIndex = 0; orderedIndex < searchCount; ++orderedIndex) {
-		selectBestScoredMove(moveData, scores, orderedIndex, searchCount);
-		const Move& m = moveData[orderedIndex];
+		int best = orderedIndex;
+		for (int i = orderedIndex + 1; i < searchCount; ++i) {
+			if (scores[i] > scores[best]) {
+				best = i;
+			}
+		}
+		if (best != orderedIndex) {
+			std::swap(scores[orderedIndex], scores[best]);
+			std::swap(qMoves[orderedIndex], qMoves[best]);
+		}
+		const Move& m = qMoves[orderedIndex];
 
 		Unmove u = b.makeMove(m);
-		int childScore = quiescence(b, -beta, -alpha);
+		int childScore = quiescence(b, -beta, -alpha, ply + 1, qply + 1, repHistory);
 		if (isSearchAborted(childScore)) {
 			b.unmakeMove(m, u);
 			return SEARCH_ABORTED;
 		}
 
 		int score = -childScore;
-		score = fix_mate_score(score, 1);
 
 		b.unmakeMove(m, u);
 
@@ -1584,7 +1844,7 @@ int Engine::quiescence(board& b, int alpha, int beta)
 			alpha = score;
 	}
 
-	return fix_mate_score(alpha, 0);
+	return alpha;
 
 }
 
