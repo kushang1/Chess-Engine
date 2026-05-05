@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 
@@ -74,6 +75,11 @@ bool moveCanChangeCastlingRights(Piece piece, int from)
 
 UciLoop::UciLoop()
 {
+#ifdef _WIN32
+    _putenv_s("CHESS_ENGINE_UCI_INFO", "1");
+#else
+    setenv("CHESS_ENGINE_UCI_INFO", "1", 1);
+#endif
     resetPosition();
 }
 
@@ -378,15 +384,6 @@ void UciLoop::startSearch(const chess::SearchLimits& limits)
     searchThread = std::thread([this, limits, repetitions]() {
         chess::SearchResult result = engine.findBestMove(limits, repetitions);
         std::string bestMove = moveToLongAlgebraic(result.bestMove);
-
-        if (result.elapsedMs > 0 || result.nodes > 0) {
-            long long nps = result.elapsedMs > 0
-                ? (result.nodes * 1000LL) / result.elapsedMs
-                : 0;
-            writeLine("info time " + std::to_string(result.elapsedMs) +
-                " nodes " + std::to_string(result.nodes) +
-                " nps " + std::to_string(nps));
-        }
 
         writeLine("bestmove " + bestMove);
         searchRunning.store(false, std::memory_order_release);

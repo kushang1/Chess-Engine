@@ -1,14 +1,7 @@
 #include "Syzygy.h"
 
-#include <cstdio>
-#include <sstream>
-
 #include "Board.h"
 #include "tbprobe.h"
-
-#ifdef _WIN32
-#include <io.h>
-#endif
 
 namespace {
 
@@ -17,44 +10,6 @@ bool g_tbInitialized = false;
 inline int flip_sq(int sq)
 {
     return sq ^ 56;
-}
-
-void syzygyLog(const std::string& text)
-{
-#ifdef _WIN32
-    if (stderr == nullptr || _fileno(stderr) < 0) {
-        return;
-    }
-#else
-    if (stderr == nullptr) {
-        return;
-    }
-#endif
-    std::fprintf(stderr, "info string %s\n", text.c_str());
-    std::fflush(stderr);
-}
-
-void syzygyLimitedProbeLog(const std::string& text)
-{
-    static int emitted = 0;
-    if (emitted >= 32) {
-        return;
-    }
-
-    ++emitted;
-    syzygyLog(text);
-}
-
-const char* wdlName(unsigned wdl)
-{
-    switch (wdl) {
-    case TB_LOSS: return "loss";
-    case TB_BLESSED_LOSS: return "blessed_loss";
-    case TB_DRAW: return "draw";
-    case TB_CURSED_WIN: return "cursed_win";
-    case TB_WIN: return "win";
-    default: return "unknown";
-    }
 }
 
 int scoreFromWdl(unsigned wdl)
@@ -125,7 +80,6 @@ void build_bitboards(const board& b,
 }
 
 bool prepareProbe(const board& b,
-    const char* mode,
     uint64_t& white,
     uint64_t& black,
     uint64_t& kings,
@@ -137,26 +91,16 @@ bool prepareProbe(const board& b,
     int& pieceCount)
 {
     if (!syzygyIsAvailable()) {
-        std::ostringstream log;
-        log << "syzygy " << mode << " probe skipped: tablebases are not available";
-        syzygyLimitedProbeLog(log.str());
         return false;
     }
 
     build_bitboards(b, white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount);
 
     if (pieceCount > static_cast<int>(TB_LARGEST)) {
-        std::ostringstream log;
-        log << "syzygy " << mode << " probe skipped: " << pieceCount
-            << " pieces exceeds supported max " << TB_LARGEST;
-        syzygyLimitedProbeLog(log.str());
         return false;
     }
 
     if (b.castleRights != 0) {
-        std::ostringstream log;
-        log << "syzygy " << mode << " probe skipped: castling rights are not supported";
-        syzygyLimitedProbeLog(log.str());
         return false;
     }
 
@@ -170,22 +114,14 @@ bool initSyzygy(const char* path)
     const char* safePath = path != nullptr ? path : "";
     g_tbInitialized = tb_init(safePath);
 
-    std::ostringstream log;
     if (!g_tbInitialized) {
-        log << "syzygy init failed: " << safePath;
-        syzygyLog(log.str());
         return false;
     }
 
     if (TB_LARGEST == 0) {
-        log << "syzygy path initialized but no tablebase files were found: " << safePath;
-        syzygyLog(log.str());
         return false;
     }
 
-    log << "syzygy path loaded: " << safePath
-        << " max pieces supported: " << TB_LARGEST;
-    syzygyLog(log.str());
     return true;
 }
 
@@ -206,7 +142,7 @@ bool probeSyzygy(board& b, int& outScore, Move& outBestMove)
 
     uint64_t white, black, kings, queens, rooks, bishops, knights, pawns;
     int pieceCount;
-    if (!prepareProbe(b, "WDL", white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount)) {
+    if (!prepareProbe(b, white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount)) {
         return false;
     }
 
@@ -217,19 +153,11 @@ bool probeSyzygy(board& b, int& outScore, Move& outBestMove)
     );
 
     if (wdl == TB_RESULT_FAILED) {
-        std::ostringstream log;
-        log << "syzygy WDL probe failed/missing for " << pieceCount << "-piece position";
-        syzygyLimitedProbeLog(log.str());
         return false;
     }
 
     outScore = scoreFromWdl(wdl);
 
-    std::ostringstream log;
-    log << "syzygy WDL probe hit: " << pieceCount
-        << " pieces wdl=" << wdlName(wdl)
-        << " score=" << outScore;
-    syzygyLimitedProbeLog(log.str());
     return true;
 }
 
@@ -240,7 +168,7 @@ bool probeSyzygyRoot(board& b, int& outScore, Move& outBestMove)
 
     uint64_t white, black, kings, queens, rooks, bishops, knights, pawns;
     int pieceCount;
-    if (!prepareProbe(b, "root DTZ", white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount)) {
+    if (!prepareProbe(b, white, black, kings, queens, rooks, bishops, knights, pawns, pieceCount)) {
         return false;
     }
 
@@ -255,9 +183,6 @@ bool probeSyzygyRoot(board& b, int& outScore, Move& outBestMove)
     );
 
     if (tbRes == TB_RESULT_FAILED) {
-        std::ostringstream log;
-        log << "syzygy root DTZ probe failed/missing for " << pieceCount << "-piece position";
-        syzygyLog(log.str());
         return false;
     }
 
@@ -265,10 +190,6 @@ bool probeSyzygyRoot(board& b, int& outScore, Move& outBestMove)
         unsigned terminalWdl = TB_GET_WDL(tbRes);
         outScore = scoreFromWdl(terminalWdl);
 
-        std::ostringstream log;
-        log << "syzygy root DTZ probe hit terminal position: wdl="
-            << wdlName(terminalWdl) << " score=" << outScore;
-        syzygyLog(log.str());
         return true;
     }
 
@@ -313,11 +234,5 @@ bool probeSyzygyRoot(board& b, int& outScore, Move& outBestMove)
 
     outBestMove = best;
 
-    std::ostringstream log;
-    log << "syzygy root DTZ probe hit: " << pieceCount
-        << " pieces wdl=" << wdlName(wdl)
-        << " dtz=" << TB_GET_DTZ(tbRes)
-        << " score=" << outScore;
-    syzygyLog(log.str());
     return true;
 }

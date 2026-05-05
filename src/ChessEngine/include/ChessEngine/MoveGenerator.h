@@ -80,6 +80,7 @@ public:
 
     bool isSquareAttacked(const board& Board, int sq, bool byWhite);
     int findKing(const board& Board, bool white);
+    bool isKinginCheck(const board& Board, bool white);
 };
 
 #endif

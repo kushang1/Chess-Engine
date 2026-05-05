@@ -2,8 +2,6 @@
 
 #include <array>
 
-#include "Profiler.h"
-
 namespace {
 
 constexpr Bitboard FULL_MASK = ~0ULL;
@@ -88,7 +86,6 @@ inline int updatedCastleRights(int currentRights, Piece moved, int from, Piece c
 }
 
 inline Bitboard attackersTo(const board& b, int sq, bool byWhite, Bitboard occ) {
-    Profiler::ScopedTimer timer(Profiler::LegalityChecking);
     if (sq < 0 || sq >= 64) {
         return 0;
     }
@@ -104,7 +101,6 @@ inline Bitboard attackersTo(const board& b, int sq, bool byWhite, Bitboard occ) 
 }
 
 void computePins(const board& b, GenerationContext& ctx) {
-    Profiler::ScopedTimer timer(Profiler::LegalityChecking);
     Bitboard enemyOrthogonal = rookQueens(b, !ctx.whiteToMove);
     Bitboard enemyDiagonal = bishopQueens(b, !ctx.whiteToMove);
 
@@ -590,8 +586,6 @@ int countCastles(const board& b, const GenerationContext& ctx, bool legalOnly) {
 }
 
 int countMoves(board& b, bool legalOnly) {
-    Profiler::ScopedTimer timer(Profiler::MoveGeneration);
-
     GenerationContext ctx = buildContext(b, legalOnly);
     if (ctx.kingSq == -1) {
         return 0;
@@ -622,7 +616,6 @@ int countMoves(board& b, bool legalOnly) {
 }
 
 void generateMoves(board& b, MoveList& moves, bool legalOnly) {
-    Profiler::ScopedTimer timer(Profiler::MoveGeneration);
     moves.clear();
 
     GenerationContext ctx = buildContext(b, legalOnly);
@@ -690,4 +683,10 @@ bool MoveGenerator::isSquareAttacked(const board& Board, int sq, bool byWhite) {
 
 int MoveGenerator::findKing(const board& Board, bool white) {
     return Board.kingSquare(white);
+}
+
+bool MoveGenerator::isKinginCheck(const board& Board, bool white) {
+    int KingSquare = findKing(Board, white);
+    // A king is in check when the opponent attacks its square.
+    return KingSquare != -1 && isSquareAttacked(Board, KingSquare, !white);
 }

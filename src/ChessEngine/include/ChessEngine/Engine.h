@@ -33,14 +33,15 @@ private:
     int evaluate(board &b);
     static const int MAX_DEPTH = 64;
 
-    Move killerMoves[2][MAX_DEPTH];
-    int historyHeuristic[64][64];
+    Move killerMoves[MAX_DEPTH][2];
+    int historyHeuristic[2][64][64];
 
 
     int search(board& b, int depth, int alpha, int beta,
         std::vector<uint64_t>& repHistory);
 
-    int scoreMove(const Move& m, const board& b, int depth);
+    int scoreMove(const Move& m, const board& b, int ply,
+        bool haveTTMove, const Move& ttMove);
 
     int quiescence(board& b, int alpha, int beta);
 

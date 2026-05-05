@@ -11,7 +11,7 @@
 #include <iomanip>
 #include <new>
 #include <random>
-#include <sstream>
+#include <string>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -30,6 +30,12 @@ static const int MATE_SCORE = 2000000000;       // same as your INF
 static const int MATE_THRESHOLD = MATE_SCORE - 10000;
 
 static const int INF = 2000000000;
+static const int SEARCH_ABORTED = -2000000001;
+
+static inline bool isSearchAborted(int score)
+{
+	return score == SEARCH_ABORTED;
+}
 
 namespace {
 
@@ -39,55 +45,12 @@ constexpr int DefaultHashMb = 128;
 constexpr int MinHashMb = 1;
 constexpr int MaxHashMb = 4096;
 constexpr int MaxBookSelectionPool = 8;
-
-void engineLog(const std::string& text)
-{
-#ifdef _WIN32
-	const std::string debugLine = "info string " + text + "\n";
-	OutputDebugStringA(debugLine.c_str());
-	if (stderr == nullptr || _fileno(stderr) < 0) {
-		return;
-	}
-#else
-	if (stderr == nullptr) {
-		return;
-	}
-#endif
-	std::fprintf(stderr, "info string %s\n", text.c_str());
-	std::fflush(stderr);
-}
+constexpr const char* UciInfoEnvVar = "CHESS_ENGINE_UCI_INFO";
 
 std::mt19937_64& bookRng()
 {
 	static std::mt19937_64 rng(std::random_device{}());
 	return rng;
-}
-
-std::string moveToUciText(const Move& move)
-{
-	if (move.from < 0 || move.to < 0) {
-		return "0000";
-	}
-
-	auto square = [](int sq) {
-		std::string out;
-		out.push_back(static_cast<char>('a' + (sq & 7)));
-		out.push_back(static_cast<char>('8' - (sq >> 3)));
-		return out;
-	};
-
-	std::string out = square(move.from) + square(move.to);
-	if (move.wasPromotion) {
-		char promotion = 'q';
-		switch (move.promotedTo) {
-		case WR: case BR: promotion = 'r'; break;
-		case WB: case BB: promotion = 'b'; break;
-		case WN: case BN: promotion = 'n'; break;
-		default: break;
-		}
-		out.push_back(promotion);
-	}
-	return out;
 }
 
 bool sameMoveIdentity(const Move& lhs, const Move& rhs)
@@ -110,6 +73,97 @@ bool findLegalEquivalent(const std::vector<Move>& legalMoves, const Move& candid
 		}
 	}
 	return false;
+}
+
+bool uciInfoOutputEnabled()
+{
+	const char* value = std::getenv(UciInfoEnvVar);
+	return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+void appendUciMove(std::string& out, const Move& move)
+{
+	if (move.from < 0 || move.to < 0) {
+		out += "0000";
+		return;
+	}
+
+	auto appendSquare = [&](int sq) {
+		out.push_back(static_cast<char>('a' + (sq & 7)));
+		out.push_back(static_cast<char>('8' - (sq >> 3)));
+		};
+
+	appendSquare(move.from);
+	appendSquare(move.to);
+
+	if (move.wasPromotion) {
+		char promotion = 'q';
+		switch (move.promotedTo) {
+		case WR: case BR: promotion = 'r'; break;
+		case WB: case BB: promotion = 'b'; break;
+		case WN: case BN: promotion = 'n'; break;
+		default: break;
+		}
+		out.push_back(promotion);
+	}
+}
+
+void appendUciScore(std::string& out, int score)
+{
+	if (score > MATE_THRESHOLD) {
+		int plies = MATE_SCORE - score;
+		int moves = std::max(1, (plies + 1) / 2);
+		out += " score mate " + std::to_string(moves);
+		return;
+	}
+
+	if (score < -MATE_THRESHOLD) {
+		int plies = MATE_SCORE + score;
+		int moves = std::max(1, (plies + 1) / 2);
+		out += " score mate -" + std::to_string(moves);
+		return;
+	}
+
+	out += " score cp " + std::to_string(score);
+}
+
+void writeUciInfoLine(const std::string& line)
+{
+#ifdef _WIN32
+	const std::string output = line + "\n";
+	HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+	if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	DWORD written = 0;
+	WriteFile(handle, output.data(), static_cast<DWORD>(output.size()), &written, nullptr);
+#else
+	std::fputs(line.c_str(), stdout);
+	std::fputc('\n', stdout);
+#endif
+}
+
+void emitCompletedDepthInfo(int depth, int score, const Move& bestMove,
+	std::chrono::steady_clock::time_point searchStart)
+{
+	auto now = std::chrono::steady_clock::now();
+	long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+		now - searchStart).count();
+	long long nodes = totalNodes.load(std::memory_order_relaxed);
+	long long nps = elapsedMs > 0 ? (nodes * 1000LL) / elapsedMs : 0;
+
+	std::string line;
+	line.reserve(96);
+	line += "info depth " + std::to_string(depth);
+	line += " nodes " + std::to_string(nodes);
+	line += " nps " + std::to_string(nps);
+	line += " time " + std::to_string(elapsedMs);
+	appendUciScore(line, score);
+	line += " pv ";
+	appendUciMove(line, bestMove);
+
+	writeUciInfoLine(line);
 }
 
 void addUniquePath(std::vector<fs::path>& paths, const fs::path& path)
@@ -275,9 +329,9 @@ private:
 
 
 Engine::Engine() : stopSearch(false) {
-	for (int i = 0; i < 2; i++)
-		for (int d = 0; d < MAX_DEPTH; d++)
-			killerMoves[i][d] = Move();  // invalid move
+	for (int ply = 0; ply < MAX_DEPTH; ++ply)
+		for (int slot = 0; slot < 2; ++slot)
+			killerMoves[ply][slot] = Move();  // invalid move
 
 	memset(historyHeuristic, 0, sizeof(historyHeuristic));
 
@@ -302,16 +356,10 @@ void Engine::initializeExternalData()
 	if (!bookPath.empty()) {
 		loadOpeningBook(bookPath.string());
 	}
-	else {
-		engineLog("book file not found; set CHESS_BOOK_FILE or place a Polyglot book under Book\\Human.bin");
-	}
 
 	std::string syzygyPath = resolveSyzygyPath();
 	if (!syzygyPath.empty()) {
 		initSyzygy(syzygyPath.c_str());
-	}
-	else {
-		engineLog("syzygy path not found; set CHESS_SYZYGY_PATH or place tablebases under syzygy");
 	}
 }
 
@@ -489,28 +537,33 @@ static const int kingPST[64] =
 // ==========================================================
 // MOVE ORDERING (CAPTURE + KILLER + HISTORY)
 // ==========================================================
-int Engine::scoreMove(const Move& m, const board& b, int depth)
+int Engine::scoreMove(const Move& m, const board& b, int ply,
+	bool haveTTMove, const Move& ttMove)
 {
-	depth = std::clamp(depth, 0, MAX_DEPTH - 1);
+	ply = std::clamp(ply, 0, MAX_DEPTH - 1);
 
-	// 1. MVV-LVA captures
+	// 1. TT move first, even when the stored entry is shallow.
+	if (haveTTMove && sameMoveIdentity(m, ttMove)) {
+		return 1000000;
+	}
+
+	// 2. MVV-LVA captures before quiet moves.
 	if (m.captured != EMPTY) {
 		int victim = pieceValueSimple[m.captured];
 		int attacker = pieceValueSimple[m.moved];
-		return 100000 + (victim * 10 - attacker);
+		return 500000 + (victim * 100 - attacker);
 	}
 
-	// 2. Killer moves
-	if (killerMoves[0][depth].from == m.from &&
-		killerMoves[0][depth].to == m.to)
-		return 90000;
+	// 3. Killer moves are quiet beta-cutoff moves from the same ply.
+	if (sameMoveIdentity(killerMoves[ply][0], m))
+		return 400000;
 
-	if (killerMoves[1][depth].from == m.from &&
-		killerMoves[1][depth].to == m.to)
-		return 80000;
+	if (sameMoveIdentity(killerMoves[ply][1], m))
+		return 390000;
 
-	// 3. History heuristic for quiet moves
-	return historyHeuristic[m.from][m.to];
+	// 4. Quiet moves use side-aware history scores.
+	int side = b.isWhiteTurn ? 0 : 1;
+	return historyHeuristic[side][m.from][m.to];
 }
 
 // ==========================================================
@@ -614,13 +667,17 @@ int Engine::evaluate(board& b)
 	// White passed pawns
 	for (int i = 0; i < b.pieceCount[WP]; i++) {
 		int sq = b.pieceList[WP][i];
-		if (isPassed(sq, true)) score += 40 + 10 * (sq >> 3);
+		// White advances toward smaller board rows, so invert the row index.
+		int advancedRanks = 7 - (sq >> 3);
+		if (isPassed(sq, true)) score += 40 + 10 * advancedRanks;
 	}
 
 	// Black passed pawns
 	for (int i = 0; i < b.pieceCount[BP]; i++) {
 		int sq = b.pieceList[BP][i];
-		if (isPassed(sq, false)) score -= 40 + 10 * (7 - (sq >> 3));
+		// Black advances toward larger board rows.
+		int advancedRanks = sq >> 3;
+		if (isPassed(sq, false)) score -= 40 + 10 * advancedRanks;
 	}
 
 	// ----------------------------------------------------------
@@ -666,8 +723,15 @@ int Engine::evaluate(board& b)
 				if (nr < 0 || nr > 7 || nc < 0 || nc > 7) continue;
 				int sq = nr * 8 + nc;
 
-				bool whiteKingInCheck = moveGenerator->isSquareAttacked(b, b.pieceList[WK][0], false);
-				bool blackKingInCheck = moveGenerator->isSquareAttacked(b, b.pieceList[BK][0], true);
+				// Count enemy attacks on the king zone; the old code computed checks but never used them.
+				if (moveGenerator->isSquareAttacked(b, sq, !kingIsWhite)) {
+					if (kingIsWhite) {
+						++atkWhiteKing;
+					}
+					else {
+						++atkBlackKing;
+					}
+				}
 			}
 		};
 
@@ -684,17 +748,20 @@ int Engine::evaluate(board& b)
 		int r = ksq >> 3, c = ksq & 7;
 		int s = 0;
 
-		if (isWhite && r < 6)
+		// The shield is on the rank in front of the king, including back-rank castled kings.
+		if (isWhite && r > 0)
 		{
-			if (b.pieceAt((r - 1) * 8 + c) == WP) s += 15;
-			if (c > 0 && b.pieceAt((r - 1) * 8 + c - 1) == WP) s += 10;
-			if (c < 7 && b.pieceAt((r - 1) * 8 + c + 1) == WP) s += 10;
+			int front = r - 1;
+			if (b.pieceAt(front * 8 + c) == WP) s += 15;
+			if (c > 0 && b.pieceAt(front * 8 + c - 1) == WP) s += 10;
+			if (c < 7 && b.pieceAt(front * 8 + c + 1) == WP) s += 10;
 		}
-		else if (!isWhite && r > 1)
+		else if (!isWhite && r < 7)
 		{
-			if (b.pieceAt((r + 1) * 8 + c) == BP) s += 15;
-			if (c > 0 && b.pieceAt((r + 1) * 8 + c - 1) == BP) s += 10;
-			if (c < 7 && b.pieceAt((r + 1) * 8 + c + 1) == BP) s += 10;
+			int front = r + 1;
+			if (b.pieceAt(front * 8 + c) == BP) s += 15;
+			if (c > 0 && b.pieceAt(front * 8 + c - 1) == BP) s += 10;
+			if (c < 7 && b.pieceAt(front * 8 + c + 1) == BP) s += 10;
 		}
 		return s;
 		};
@@ -783,31 +850,12 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 	maxDepth = std::clamp(maxDepth, 1, MAX_DEPTH - 1);
 	this->maxDepth = maxDepth;
+	const bool emitUciInfo = uciInfoOutputEnabled();
 
 	Move bookMove = probeBook(b);
 	if (bookMove.from != -1)
 	{
 		return bookMove;
-	}
-
-	int rootPieceCount = 0;
-	for (int p = BQ; p <= WB; ++p) {
-		rootPieceCount += b.pieceCount[p];
-	}
-	if (syzygyIsAvailable() &&
-		rootPieceCount <= static_cast<int>(syzygyMaxPieces()) &&
-		b.castleRights == 0) {
-		int tbScore = 0;
-		Move tbMove;
-		if (probeSyzygyRoot(b, tbScore, tbMove) && tbMove.from != -1) {
-			std::vector<Move> legalMoves = moveGenerator->generateLegalMoves(b);
-			Move legalTbMove;
-			if (findLegalEquivalent(legalMoves, tbMove, legalTbMove)) {
-				engineLog("syzygy selected root move: " + moveToUciText(legalTbMove));
-				return legalTbMove;
-			}
-			engineLog("syzygy root move rejected as illegal: " + moveToUciText(tbMove));
-		}
 	}
 
 	// --------------------------------------------
@@ -836,6 +884,17 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 	if (rootMoves.empty())
 		return Move(-1, -1, EMPTY, EMPTY, 0);
+
+	if (syzygyIsAvailable()) {
+		int tbScore = 0;
+		Move tbMove;
+		if (probeSyzygyRoot(b, tbScore, tbMove)) {
+			Move legalTbMove;
+			if (findLegalEquivalent(rootMoves, tbMove, legalTbMove)) {
+				return legalTbMove;
+			}
+		}
+	}
 
 	Move bestFullMove = rootMoves[0];
 	int  bestFullScore = -INF;
@@ -872,30 +931,91 @@ Move Engine::findBestMove(board& b, int maxDepth,
 		struct RootSearchResult { Move move; int score; bool full; };
 		std::vector<RootSearchResult> results(rootMoves.size());
 
-		// --------------------------------------------
-		// Search root moves serially for tournament stability.
-		// --------------------------------------------
-		for (size_t i = 0; i < rootMoves.size(); i++)
-		{
-			if (stopSearch.load(std::memory_order_relaxed)) {
-				results[i] = { rootMoves[i], -INF, false };
-				continue;
+		int bestDepthScore = -INF;
+		Move bestDepthMove = rootMoves[0];
+		bool anyFullThisDepth = false;
+
+		auto collectRootResults = [&]() {
+			bestDepthScore = -INF;
+			bestDepthMove = rootMoves[0];
+			anyFullThisDepth = false;
+
+			for (auto& r : results)
+			{
+				if (r.full)
+				{
+					if (!anyFullThisDepth || r.score > bestDepthScore)
+					{
+						anyFullThisDepth = true;
+						bestDepthScore = r.score;
+						bestDepthMove = r.move;
+					}
+				}
+			}
+			};
+
+		auto searchRootMoves = [&](int rootAlpha, int rootBeta) {
+			for (auto& r : results) {
+				r = { Move(), -INF, false };
 			}
 
-			Move rm = rootMoves[i];
-			board local = b;
-			std::vector<uint64_t> localRepHistory = repHistory;
+			// Search root moves serially for tournament stability.
+			for (size_t i = 0; i < rootMoves.size(); i++)
+			{
+				if (stopSearch.load(std::memory_order_relaxed)) {
+					results[i] = { rootMoves[i], -INF, false };
+					return false;
+				}
 
-			Unmove u = local.makeMove(rm);
-			(void)u;
+				Move rm = rootMoves[i];
+				board local = b;
+				std::vector<uint64_t> localRepHistory = repHistory;
 
-			bool fullEval = true;
-			int score = -search(local, depth - 1, -INF, INF, localRepHistory);
+				Unmove u = local.makeMove(rm);
+				(void)u;
 
-			if (stopSearch.load(std::memory_order_relaxed))
-				fullEval = false;
+				bool fullEval = true;
+				int childScore = search(local, depth - 1, -rootBeta, -rootAlpha, localRepHistory);
+				int score = -INF;
+				if (isSearchAborted(childScore)) {
+					results[i] = { rm, -INF, false };
+					return false;
+				}
+				else {
+					score = -childScore;
+				}
 
-			results[i] = { rm, score, fullEval };
+				if (stopSearch.load(std::memory_order_relaxed))
+					fullEval = false;
+
+				results[i] = { rm, score, fullEval };
+			}
+
+			return true;
+			};
+
+		constexpr int AspirationWindow = 50;
+		int rootAlpha = -INF;
+		int rootBeta = INF;
+		bool usedAspiration = false;
+
+		if (depth > 1 && haveFull) {
+			rootAlpha = std::max(-INF, bestFullScore - AspirationWindow);
+			rootBeta = std::min(INF, bestFullScore + AspirationWindow);
+			usedAspiration = true;
+		}
+
+		searchRootMoves(rootAlpha, rootBeta);
+		collectRootResults();
+
+		if (usedAspiration &&
+			!stopSearch.load(std::memory_order_relaxed) &&
+			anyFullThisDepth &&
+			(bestDepthScore <= rootAlpha || bestDepthScore >= rootBeta))
+		{
+			// One stable fallback to full window on aspiration fail-low/high.
+			searchRootMoves(-INF, INF);
+			collectRootResults();
 		}
 
 		now = std::chrono::steady_clock::now();
@@ -903,26 +1023,6 @@ Move Engine::findBestMove(board& b, int maxDepth,
 			std::chrono::duration_cast<std::chrono::milliseconds>(now - searchStart).count();
 
 		bool timedOut = elapsed >= timeLimitMs || stopSearch.load();
-
-		int bestDepthScore = -INF;
-		Move bestDepthMove = rootMoves[0];
-		bool anyFullThisDepth = false;
-
-		// --------------------------------------------
-		// Collect FULL results (not cut early)
-		// --------------------------------------------
-		for (auto& r : results)
-		{
-			if (r.full)
-			{
-				if (!anyFullThisDepth || r.score > bestDepthScore)
-				{
-					anyFullThisDepth = true;
-					bestDepthScore = r.score;
-					bestDepthMove = r.move;
-				}
-			}
-		}
 
 		if (!timedOut)
 		{
@@ -932,6 +1032,10 @@ Move Engine::findBestMove(board& b, int maxDepth,
 				bestFullScore = bestDepthScore;
 				haveFull = true;
 
+				if (emitUciInfo) {
+					// Emit only after a fully completed root depth; never from node loops.
+					emitCompletedDepthInfo(depth, bestFullScore, bestFullMove, searchStart);
+				}
 			}
 			else {
 			}
@@ -993,7 +1097,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 
 	if (stopSearch.load(std::memory_order_relaxed)) {
 		
-		return -INF;
+		return SEARCH_ABORTED;
 	}
 
 	// --------------------------------------------------
@@ -1035,64 +1139,45 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	Move ttMove;
 	bool haveTTMove = false;
 
-	if (entry.flag != TT_EMPTY && entry.key == key && entry.depth >= depth)
+	if (entry.flag != TT_EMPTY && entry.key == key)
 	{
-		int stored = entry.score;
-
-		if (entry.flag == TT_EXACT)
-			return stored;
-		else if (entry.flag == TT_ALPHA && stored <= alpha)
-			return stored;
-		else if (entry.flag == TT_BETA && stored >= beta)
-			return stored;
-
-		// we can still use TT move for ordering
+		// Always keep the stored best move for ordering, even from shallow entries.
 		ttMove = entry.bestMove;
-		haveTTMove = true;
+		haveTTMove = ttMove.from != -1 && ttMove.to != -1;
+
+		if (entry.depth >= depth) {
+			int stored = entry.score;
+
+			if (entry.flag == TT_EXACT)
+				return stored;
+			else if (entry.flag == TT_ALPHA && stored <= alpha)
+				return stored;
+			else if (entry.flag == TT_BETA && stored >= beta)
+				return stored;
+		}
+
 	}
 
-	
-	int tbScore;
-	Move tbMove;
+	// Avoid tablebase overhead in the normal hot path; count pieces only when
+	// a near-root Syzygy probe is actually possible.
+	if (syzygyIsAvailable() && !b.hasEnPassant && depth >= maxDepth - 2) {
+		int totalPieces = 0;
+		for (int p = BQ; p <= WB; ++p)
+			totalPieces += b.pieceCount[p];
 
-	// ------------------------------------
-	// SYZYGY SAFETY CONDITIONS
-	// ------------------------------------
-	bool tbSafe = true;
+		int tbScore;
+		Move tbMove;
+		if (totalPieces <= (int)TB_LARGEST && probeSyzygy(b, tbScore, tbMove)) {
 
-	// Build piece count (fastest way)
-	int totalPieces = 0;
-	for (int p = BQ; p <= WB; ++p)
-		totalPieces += b.pieceCount[p];
+			TTEntry& tbEntry = tt[key & ttMask];
+			tbEntry.key = key;
+			tbEntry.score = tbScore;
+			tbEntry.depth = 127;     // highest possible depth
+			tbEntry.flag = TT_EXACT;
+			tbEntry.bestMove = tbMove;
 
-	// 1. Must be = TB_LARGEST (usually = 7)
-	if (totalPieces > (int)TB_LARGEST)
-		tbSafe = false;
-
-	// 3. EP must be disabled (EP creates illegal tablebase states)
-	if (b.hasEnPassant)
-		tbSafe = false;
-
-	
-	// 5. Avoid tablebase inside null move / unstable positions
-	// OPTIONAL but recommended
-	if (depth < maxDepth - 2) // not at or near root
-		tbSafe = false;
-
-
-	// ------------------------------------
-	// If safe ? probe TB
-	// ------------------------------------
-	if (tbSafe && probeSyzygy(b, tbScore, tbMove)) {
-
-		TTEntry& tbEntry = tt[key & ttMask];
-		tbEntry.key = key;
-		tbEntry.score = tbScore;
-		tbEntry.depth = 127;     // highest possible depth
-		tbEntry.flag = TT_EXACT;
-		tbEntry.bestMove = tbMove;
-
-		return tbScore;
+			return tbScore;
+		}
 	}
 
 	
@@ -1142,10 +1227,10 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			b.isWhiteTurn = !b.isWhiteTurn;
 			b.hasEnPassant = false;
 			b.enPassantSquare = -1;
-            b.hash ^= ZobristData::sideToMove(b.isWhiteTurn);
+			b.hash ^= ZobristData::sideToMove(b.isWhiteTurn);
 
 			const int R = 2; // depth reduction
-			int score = -search(b, depth - 1 - R,
+			int childScore = search(b, depth - 1 - R,
 				-beta, -beta + 1,
 				repHistory);
 
@@ -1154,6 +1239,12 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			b.hasEnPassant = prevHasEP;
 			b.enPassantSquare = prevEPSq;
             b.hash = prevHash;
+
+			if (isSearchAborted(childScore)) {
+				return SEARCH_ABORTED;
+			}
+
+			int score = -childScore;
 
 			// Fail-high ? position is so good we can prune
 			if (score >= beta) {
@@ -1181,16 +1272,12 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	// Score and order moves
 	int scores[MoveList::MAX_MOVES];
 	Move* moveData = moves.data();
+	int ply = std::clamp(maxDepth - depth, 0, MAX_DEPTH - 1);
 
 	for (int i = 0; i < moves.count; ++i)
 	{
 		Move& m = moveData[i];
-		int s = scoreMove(m, b, depth);
-
-		if (haveTTMove && m.from == ttMove.from && m.to == ttMove.to)
-			s += 200000; // big bonus for TT move
-
-		scores[i] = s;
+		scores[i] = scoreMove(m, b, ply, haveTTMove, ttMove);
 	}
 
 	int besteval = -INF;
@@ -1200,6 +1287,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	// SEARCH CHILD MOVES
 	// -------------------------------
 	int moveIndex = 0;
+	bool firstMove = true;
 
 	for (int orderedIndex = 0; orderedIndex < moves.count; ++orderedIndex) {
 		selectBestScoredMove(moveData, scores, orderedIndex, moves.count);
@@ -1226,8 +1314,8 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		}
 
 		bool isKiller =
-			(killerMoves[0][depth].from == move.from && killerMoves[0][depth].to == move.to) ||
-			(killerMoves[1][depth].from == move.from && killerMoves[1][depth].to == move.to);
+			sameMoveIdentity(killerMoves[ply][0], move) ||
+			sameMoveIdentity(killerMoves[ply][1], move);
 
 		// Base depth for this move: one ply less
 		int newDepth = depth - 1;
@@ -1254,6 +1342,7 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 		}
 
 		int eval;
+		bool usePvs = !firstMove && !inCheck && depth > 1;
 
 		// ---------------------------------------
 		// LMR CONDITIONS:
@@ -1273,30 +1362,75 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 			int R = 1;  // reduction (tuneable, try 1 or 2)
 
 			// Reduced-depth search with null window
-			eval = -search(b, newDepth - R,
+			int childScore = search(b, newDepth - R,
 				-alpha - 1, -alpha,
 				repHistory);
+			if (isSearchAborted(childScore)) {
+				b.unmakeMove(move, u);
+				return SEARCH_ABORTED;
+			}
 
+			eval = -childScore;
 			eval = fix_mate_score(eval, 1);
 
 			// If it looks better than alpha, research at full depth
 			if (eval > alpha) {
-				eval = -search(b, newDepth,
+				childScore = search(b, newDepth,
 					-beta, -alpha,
 					repHistory);
+				if (isSearchAborted(childScore)) {
+					b.unmakeMove(move, u);
+					return SEARCH_ABORTED;
+				}
 
+				eval = -childScore;
 				eval = fix_mate_score(eval, 1);
 			}
 		}
 		else {
-			// Normal full-depth search (with check extension applied)
-			eval = -search(b, newDepth,
-				-beta, -alpha,
-				repHistory);
+			int childScore;
+			if (usePvs) {
+				// PVS: late moves get a null-window probe before a full re-search.
+				childScore = search(b, newDepth,
+					-alpha - 1, -alpha,
+					repHistory);
+				if (isSearchAborted(childScore)) {
+					b.unmakeMove(move, u);
+					return SEARCH_ABORTED;
+				}
 
-			eval = fix_mate_score(eval, 1);
+				eval = -childScore;
+				eval = fix_mate_score(eval, 1);
+
+				if (eval > alpha) {
+					childScore = search(b, newDepth,
+						-beta, -alpha,
+						repHistory);
+					if (isSearchAborted(childScore)) {
+						b.unmakeMove(move, u);
+						return SEARCH_ABORTED;
+					}
+
+					eval = -childScore;
+					eval = fix_mate_score(eval, 1);
+				}
+			}
+			else {
+				// First move, check nodes, and shallow nodes keep the full window.
+				childScore = search(b, newDepth,
+					-beta, -alpha,
+					repHistory);
+				if (isSearchAborted(childScore)) {
+					b.unmakeMove(move, u);
+					return SEARCH_ABORTED;
+				}
+
+				eval = -childScore;
+				eval = fix_mate_score(eval, 1);
+			}
 		}
 		
+		firstMove = false;
 		b.unmakeMove(move, u);
 
 		// ------------------------------
@@ -1309,18 +1443,18 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 
 		if (eval > alpha) {
 			alpha = eval;
-
-			// If quiet move, store killers
-			if (!isCapture) {
-				killerMoves[1][depth] = killerMoves[0][depth];
-				killerMoves[0][depth] = move;
-			}
 		}
 
 		// Alpha–beta cutoff
 		if (alpha >= beta) {
 			if (!isCapture) {
-				historyHeuristic[move.from][move.to] += depth * depth;
+				// Quiet beta cutoffs update killer and side-aware history tables.
+				if (!sameMoveIdentity(killerMoves[ply][0], move)) {
+					killerMoves[ply][1] = killerMoves[ply][0];
+					killerMoves[ply][0] = move;
+				}
+				int side = b.isWhiteTurn ? 0 : 1;
+				historyHeuristic[side][move.from][move.to] += depth * depth;
 			}
 			break;
 		}
@@ -1329,8 +1463,13 @@ int Engine::search(board& b, int depth, int alpha, int beta,
 	}
 
 
+	if (stopSearch.load(std::memory_order_relaxed)) {
+		return SEARCH_ABORTED;
+	}
+
 	// -----------------------------------
 	// STORE TT ENTRY
+	// Do not store partial results after a timeout/stop abort.
 	// -----------------------------------
 	TTEntry& store = tt[key & ttMask];
 	store.key = key;
@@ -1372,46 +1511,68 @@ int Engine::quiescence(board& b, int alpha, int beta)
 	}
 
 	if (stopSearch.load(std::memory_order_relaxed)) {
-		return -INF;
+		return SEARCH_ABORTED;
 	}
 
-	// Stand-pat evaluation: assume we do nothing
-	int standPat = evaluate(b);
+	int kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
+	bool inCheck = kingSq != -1 &&
+		moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
 
-	// Fail-high: too good for the opponent
-	if (standPat >= beta)
-		return standPat;
-
-	if (standPat > alpha)
-		alpha = standPat;
-
-	// Generate all legal moves, then filter captures
 	MoveList moves;
 	moveGenerator->generateLegalMoves(b, moves);
 
-	// Score only captures using MVV-LVA (depth 0 so killers/history are harmless)
 	int scores[MoveList::MAX_MOVES];
 	Move* moveData = moves.data();
-	int captureCount = 0;
+	int searchCount = 0;
 
-	for (auto& m : moves) {
-		if (m.captured == EMPTY) continue; // only captures in quiescence
-		moveData[captureCount] = m;
-		scores[captureCount] = scoreMove(m, b, 0);
-		++captureCount;
+	if (inCheck) {
+		// Stand-pat is illegal while in check; search every legal evasion.
+		if (moves.count == 0) {
+			return -(MATE_SCORE - maxDepth);
+		}
+
+		searchCount = moves.count;
+		for (int i = 0; i < searchCount; ++i) {
+			scores[i] = scoreMove(moveData[i], b, MAX_DEPTH - 1, false, Move());
+		}
+	}
+	else {
+		// Stand-pat evaluation: assume the quiet position can be held.
+		int standPat = evaluate(b);
+
+		// Fail-high: too good for the opponent
+		if (standPat >= beta)
+			return standPat;
+
+		if (standPat > alpha)
+			alpha = standPat;
+
+		// Score only captures using MVV-LVA (depth 0 so killers/history are harmless)
+		for (auto& m : moves) {
+			if (m.captured == EMPTY) continue; // only captures in normal quiescence
+			moveData[searchCount] = m;
+			scores[searchCount] = scoreMove(m, b, MAX_DEPTH - 1, false, Move());
+			++searchCount;
+		}
+
+		if (searchCount == 0) {
+			// No captures ? position is quiet, return stand-pat eval
+			return alpha;
+		}
 	}
 
-	if (captureCount == 0) {
-		// No captures ? position is quiet, return stand-pat eval
-		return alpha;
-	}
-
-	for (int orderedIndex = 0; orderedIndex < captureCount; ++orderedIndex) {
-		selectBestScoredMove(moveData, scores, orderedIndex, captureCount);
+	for (int orderedIndex = 0; orderedIndex < searchCount; ++orderedIndex) {
+		selectBestScoredMove(moveData, scores, orderedIndex, searchCount);
 		const Move& m = moveData[orderedIndex];
 
 		Unmove u = b.makeMove(m);
-		int score = -quiescence(b, -beta, -alpha);
+		int childScore = quiescence(b, -beta, -alpha);
+		if (isSearchAborted(childScore)) {
+			b.unmakeMove(m, u);
+			return SEARCH_ABORTED;
+		}
+
+		int score = -childScore;
 		score = fix_mate_score(score, 1);
 
 		b.unmakeMove(m, u);
@@ -1446,17 +1607,10 @@ bool Engine::loadOpeningBook(const std::string& filename)
 {
 	std::error_code ec;
 	uintmax_t fileBytes = std::filesystem::file_size(filename, ec);
-	if (!ec && (fileBytes % 16) != 0) {
-		std::ostringstream log;
-		log << "book file size is not a multiple of 16 bytes: " << filename
-			<< " bytes=" << fileBytes;
-		engineLog(log.str());
-	}
 
 	FILE* f = nullptr;
 	fopen_s(&f, filename.c_str(), "rb");
 	if (!f) {
-		engineLog("book file open failed: " + filename);
 		return false;
 	}
 
@@ -1466,37 +1620,21 @@ bool Engine::loadOpeningBook(const std::string& filename)
 	}
 
 	uint8_t buf[16];
-	uint16_t maxWeight = 0;
-	size_t weightedEntries = 0;
 	while (fread(buf, 1, 16, f) == 16) {
 		PolyglotEntry e;
 		e.key = read_be_u64(buf + 0);
 		e.move = read_be_u16(buf + 8);
 		e.weight = read_be_u16(buf + 10);
 		e.learn = read_be_u32(buf + 12);
-		maxWeight = std::max(maxWeight, e.weight);
-		if (e.weight > 1) {
-			++weightedEntries;
-		}
 		openingBook.push_back(e);
 	}
 
 	fclose(f);
 
 	if (openingBook.empty()) {
-		engineLog("book file contained no complete entries: " + filename);
 		return false;
 	}
 
-	std::ostringstream log;
-	log << "book file loaded successfully: " << filename
-		<< " entries=" << openingBook.size()
-		<< " max_weight=" << maxWeight
-		<< " weighted_entries=" << weightedEntries;
-	engineLog(log.str());
-	if (maxWeight <= 1) {
-		engineLog("book weights appear uninformative; weighted variety will fall back to equal random choice");
-	}
 	return true;
 }
 
@@ -1506,7 +1644,6 @@ bool Engine::loadOpeningBook(const std::string& filename)
 Move Engine::probeBook(board& b)
 {
 	if (openingBook.empty()) {
-		engineLog("book unavailable: no entries loaded");
 		return Move();
 	}
 
@@ -1518,14 +1655,10 @@ Move Engine::probeBook(board& b)
 			matches.push_back(&e);
 
 	if (matches.empty()) {
-		std::ostringstream log;
-		log << "book no hit: key=0x" << std::hex << key;
-		engineLog(log.str());
 		return Move();
 	}
 
 	if (moveGenerator == nullptr) {
-		engineLog("book hit ignored: move generator is not attached");
 		return Move();
 	}
 
@@ -1534,29 +1667,19 @@ Move Engine::probeBook(board& b)
 	struct BookCandidate {
 		Move move;
 		uint16_t weight;
-		uint16_t rawMove;
 	};
 
 	std::vector<BookCandidate> candidates;
 	candidates.reserve(matches.size());
-	int rejected = 0;
 	for (const PolyglotEntry* entry : matches) {
 		Move decoded = polyglotDecodeMove(entry->move, b);
 		Move legal;
 		if (findLegalEquivalent(legalMoves, decoded, legal)) {
-			candidates.push_back(BookCandidate{ legal, entry->weight, entry->move });
-		}
-		else {
-			++rejected;
+			candidates.push_back(BookCandidate{ legal, entry->weight });
 		}
 	}
 
 	if (candidates.empty()) {
-		std::ostringstream log;
-		log << "book hit rejected: key=0x" << std::hex << key
-			<< std::dec << " matching_entries=" << matches.size()
-			<< " legal_candidates=0 rejected=" << rejected;
-		engineLog(log.str());
 		return Move();
 	}
 
@@ -1588,17 +1711,6 @@ Move Engine::probeBook(board& b)
 
 	std::discrete_distribution<int> dist(selectionWeights.begin(), selectionWeights.end());
 	const BookCandidate& chosen = candidates[dist(bookRng())];
-
-	std::ostringstream log;
-	log << "book hit: key=0x" << std::hex << key
-		<< std::dec << " matching_entries=" << matches.size()
-		<< " legal_candidates=" << candidates.size()
-		<< " rejected=" << rejected
-		<< " selection_pool=" << poolSize
-		<< " selected=" << moveToUciText(chosen.move)
-		<< " weight=" << chosen.weight
-		<< " raw=0x" << std::hex << chosen.rawMove;
-	engineLog(log.str());
 
 	return chosen.move;
 }
