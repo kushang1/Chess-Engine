@@ -37,12 +37,12 @@
   </ImportGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="QtSettings">
     <QtInstall>6.10.1_msvc2022_64</QtInstall>
-    <QtModules>core;gui;widgets;concurrent</QtModules>
+    <QtModules>core;gui;widgets;concurrent;svg;multimedia</QtModules>
     <QtBuildConfig>debug</QtBuildConfig>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="QtSettings">
     <QtInstall>6.10.1_msvc2022_64</QtInstall>
-    <QtModules>core;gui;widgets;concurrent</QtModules>
+    <QtModules>core;gui;widgets;concurrent;svg;multimedia</QtModules>
     <QtBuildConfig>release</QtBuildConfig>
   </PropertyGroup>
   <Target Name="QtMsBuildNotFound" BeforeTargets="CustomBuild;ClCompile" Condition="!Exists('$(QtMsBuild)\qt.targets') or !Exists('$(QtMsBuild)\qt.props')">
@@ -106,11 +106,25 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="ChessBoardWidget.cpp" />
+    <ClCompile Include="EngineController.cpp" />
+    <ClCompile Include="GameSettings.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MainWindow.cpp" />
+    <ClCompile Include="MoveListWidget.cpp" />
+    <ClCompile Include="NewGameDialog.cpp" />
+    <ClCompile Include="SettingsDialog.cpp" />
+    <ClCompile Include="SidebarWidget.cpp" />
     <QtRcc Include="resources.qrc" />
     <QtUic Include="MainWindow.ui" />
+    <QtMoc Include="ChessBoardWidget.h" />
+    <QtMoc Include="EngineController.h" />
+    <ClInclude Include="GameSettings.h" />
     <QtMoc Include="MainWindow.h" />
+    <QtMoc Include="MoveListWidget.h" />
+    <QtMoc Include="NewGameDialog.h" />
+    <QtMoc Include="SettingsDialog.h" />
+    <QtMoc Include="SidebarWidget.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\ChessEngine\ChessEngine.vcxproj">

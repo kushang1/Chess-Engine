@@ -13,4 +13,19 @@
         <file alias="black_queen.png">../../images/black_queen.png</file>
         <file alias="black_king.png">../../images/black_king.png</file>
     </qresource>
+    <qresource prefix="/icons">
+        <file alias="new-game.svg">icons/new-game.svg</file>
+        <file alias="undo.svg">icons/undo.svg</file>
+        <file alias="redo.svg">icons/redo.svg</file>
+        <file alias="resign.svg">icons/resign.svg</file>
+        <file alias="settings.svg">icons/settings.svg</file>
+        <file alias="flip.svg">icons/flip.svg</file>
+        <file alias="analysis.svg">icons/analysis.svg</file>
+        <file alias="human-vs-human.svg">icons/human-vs-human.svg</file>
+        <file alias="human-vs-engine.svg">icons/human-vs-engine.svg</file>
+        <file alias="difficulty.svg">icons/difficulty.svg</file>
+        <file alias="sound.svg">icons/sound.svg</file>
+        <file alias="theme.svg">icons/theme.svg</file>
+        <file alias="draw.svg">icons/draw.svg</file>
+    </qresource>
 </RCC>

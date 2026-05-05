@@ -1,12 +1,32 @@
 #include "MainWindow.h"
 
-#include <QDebug>
-#include <QEvent>
-#include <QGridLayout>
-#include <QIcon>
-#include <QSizePolicy>
+#include "NewGameDialog.h"
 
-#include <chrono>
+#include <QAction>
+#include <QApplication>
+#include <QDockWidget>
+#include <QDir>
+#include <QFile>
+#include <QGraphicsOpacityEffect>
+#include <QHBoxLayout>
+#include <QIcon>
+#include <QKeySequence>
+#include <QLabel>
+#include <QMessageBox>
+#include <QPropertyAnimation>
+#include <QRandomGenerator>
+#include <QShortcut>
+#include <QStackedWidget>
+#include <QStandardPaths>
+#include <QStatusBar>
+#include <QTabWidget>
+#include <QTextEdit>
+#include <QToolBar>
+#include <QUrl>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -15,23 +35,557 @@ bool isWhitePiece(Piece piece)
     return piece >= WQ && piece <= WB;
 }
 
-QString iconPathForPiece(Piece piece)
+bool isKing(Piece piece, bool white)
+{
+    return white ? piece == WK : piece == BK;
+}
+
+int pieceValue(Piece piece)
 {
     switch (piece) {
-    case WP: return ":/pieces/white_pawn.png";
-    case WR: return ":/pieces/white_rook.png";
-    case WN: return ":/pieces/white_knight.png";
-    case WB: return ":/pieces/white_bishop.png";
-    case WQ: return ":/pieces/white_queen.png";
-    case WK: return ":/pieces/white_king.png";
-    case BP: return ":/pieces/black_pawn.png";
-    case BR: return ":/pieces/black_rook.png";
-    case BN: return ":/pieces/black_knight.png";
-    case BB: return ":/pieces/black_bishop.png";
-    case BQ: return ":/pieces/black_queen.png";
-    case BK: return ":/pieces/black_king.png";
-    default: return "";
+    case WP: case BP: return 1;
+    case WN: case BN: return 3;
+    case WB: case BB: return 3;
+    case WR: case BR: return 5;
+    case WQ: case BQ: return 9;
+    default: return 0;
     }
+}
+
+double materialScore(const std::array<Piece, 64>& board)
+{
+    int score = 0;
+    for (Piece piece : board) {
+        if (piece == EMPTY) {
+            continue;
+        }
+        score += isWhitePiece(piece) ? pieceValue(piece) : -pieceValue(piece);
+    }
+    return static_cast<double>(score);
+}
+
+QString squareName(int square)
+{
+    if (square < 0 || square >= 64) {
+        return {};
+    }
+    return QString("%1%2")
+        .arg(QChar('a' + (square & 7)))
+        .arg(8 - (square >> 3));
+}
+
+QString darkStyleSheet()
+{
+    return R"(
+QMainWindow {
+    background: #101113;
+    color: #EAF2F8;
+}
+#CentralShell {
+    background: #101113;
+}
+#BoardStage {
+    background: #171A1F;
+    border: 1px solid #282D35;
+    border-radius: 12px;
+}
+#CenterStatus {
+    color: #EEF6FA;
+    font-size: 18px;
+    font-weight: 700;
+    padding: 4px 8px;
+}
+QToolBar {
+    background: #171A1F;
+    border: none;
+    border-bottom: 1px solid #262B33;
+    spacing: 8px;
+    padding: 7px 12px;
+}
+QToolBar::separator {
+    background: #303640;
+    width: 1px;
+    margin: 7px 6px;
+}
+QToolButton {
+    background: transparent;
+    border: none;
+    border-radius: 9px;
+    padding: 7px;
+}
+QToolButton:hover {
+    background: #252B33;
+}
+QToolButton:pressed {
+    background: #293D3A;
+}
+QToolButton:checked {
+    background: #21463F;
+}
+QToolButton:disabled {
+    background: transparent;
+    opacity: 0.45;
+}
+QDockWidget {
+    color: #EAF2F8;
+    titlebar-close-icon: none;
+    titlebar-normal-icon: none;
+}
+QDockWidget::title {
+    background: #171A1F;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 700;
+}
+#Sidebar {
+    background: #181B20;
+}
+#Panel, #PlayerCard, #DialogPanel, #ChoiceCard {
+    background: #22262D;
+    border: 1px solid #303741;
+    border-radius: 10px;
+}
+#ChoiceCard:hover {
+    border-color: #4E655F;
+}
+#PlayerCard[active="true"] {
+    border: 1px solid #6BE2C4;
+    background: #23302E;
+}
+#ModeLabel {
+    background: #111418;
+    color: #C7D2DE;
+    border: 1px solid #303741;
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-weight: 800;
+}
+#LightAvatar, #DarkAvatar {
+    border-radius: 21px;
+    font-weight: 800;
+}
+#LightAvatar {
+    background: #F2F5F7;
+    color: #14181D;
+}
+#DarkAvatar {
+    background: #0B0D10;
+    color: #EAF2F8;
+    border: 1px solid #3D4652;
+}
+#PlayerName, #ChoiceTitle {
+    color: #F4F8FB;
+    font-size: 14px;
+    font-weight: 800;
+}
+#MutedLabel {
+    color: #98A5B3;
+    font-size: 12px;
+}
+#MaterialLabel {
+    color: #6BE2C4;
+    font-weight: 800;
+}
+#SectionLabel {
+    color: #EAF2F8;
+    font-size: 13px;
+    font-weight: 800;
+    padding-bottom: 2px;
+}
+#ClockLabel {
+    background: #111318;
+    color: #F8FAFC;
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 20px;
+    font-weight: 800;
+}
+#ClockLabel[active="true"] {
+    border: 1px solid #6BE2C4;
+    color: #FFFFFF;
+}
+#ClockLabel[low="true"] {
+    color: #FF6B7C;
+}
+#StatusLabel {
+    background: #141820;
+    color: #DDE7EF;
+    border: 1px solid #303741;
+    border-radius: 10px;
+    padding: 9px 12px;
+    font-weight: 700;
+}
+#PillLabel {
+    background: #121416;
+    color: #94A3B8;
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-weight: 700;
+}
+#PillLabel[thinking="true"] {
+    color: #6BE2C4;
+    background: #17312D;
+}
+#MoveListWidget {
+    background: #1A1E24;
+    alternate-background-color: #20252C;
+    color: #EAF2F8;
+    border: none;
+    border-radius: 8px;
+    selection-background-color: #2F6259;
+    selection-color: #FFFFFF;
+    font-size: 13px;
+}
+#MoveListWidget QHeaderView::section {
+    background: #252B33;
+    color: #A7B4C2;
+    border: none;
+    padding: 6px;
+    font-size: 12px;
+    font-weight: 700;
+}
+#MoveListWidget::item {
+    padding: 5px 8px;
+    border-radius: 6px;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical {
+    background: #3A4149;
+    border-radius: 5px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QSplitter::handle {
+    background: transparent;
+    height: 8px;
+}
+QDialog, #SettingsDialog, #NewGameDialog {
+    background: #1B1F25;
+    color: #EAF2F8;
+}
+#DialogTitle {
+    font-size: 22px;
+    font-weight: 900;
+}
+QComboBox, QCheckBox, QRadioButton, QTextEdit {
+    color: #EAF2F8;
+    background: #252A32;
+    border: 1px solid #39414D;
+    border-radius: 8px;
+    padding: 7px 9px;
+}
+QRadioButton, QCheckBox {
+    border: none;
+    background: transparent;
+}
+QComboBox:hover, QTextEdit:hover {
+    background: #2A3039;
+}
+QComboBox:focus, QTextEdit:focus {
+    border: 1px solid #6BE2C4;
+}
+QPushButton {
+    background: #2C5A53;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-weight: 700;
+}
+QPushButton:hover {
+    background: #347064;
+}
+QPushButton:disabled {
+    background: #2A3038;
+    color: #7E8A97;
+}
+QStatusBar {
+    background: #171A1F;
+    color: #A7B4C2;
+    border-top: 1px solid #262B33;
+}
+QTabWidget::pane {
+    border: 1px solid #303741;
+    border-radius: 10px;
+    background: #1B1F25;
+}
+QTabBar::tab {
+    background: #252A32;
+    color: #AEB9C5;
+    padding: 8px 14px;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+}
+QTabBar::tab:selected {
+    color: #FFFFFF;
+    background: #2C5A53;
+}
+)";
+}
+
+QString lightStyleSheet()
+{
+    return R"(
+QMainWindow {
+    background: #F4F6F8;
+    color: #151719;
+}
+#CentralShell {
+    background: #F4F6F8;
+}
+#BoardStage {
+    background: #FFFFFF;
+    border: 1px solid #DCE3EA;
+    border-radius: 12px;
+}
+#CenterStatus {
+    color: #151719;
+    font-size: 18px;
+    font-weight: 700;
+    padding: 4px 8px;
+}
+QToolBar {
+    background: #FFFFFF;
+    border: none;
+    border-bottom: 1px solid #DDE4EA;
+    spacing: 8px;
+    padding: 7px 12px;
+}
+QToolBar::separator {
+    background: #DDE4EA;
+    width: 1px;
+    margin: 7px 6px;
+}
+QToolButton {
+    background: transparent;
+    border: none;
+    border-radius: 9px;
+    padding: 7px;
+}
+QToolButton:hover {
+    background: #ECEFF3;
+}
+QToolButton:pressed, QToolButton:checked {
+    background: #DCEFEA;
+}
+QToolButton:disabled {
+    background: transparent;
+    opacity: 0.45;
+}
+QDockWidget::title {
+    background: #FFFFFF;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 700;
+}
+#Sidebar {
+    background: #FFFFFF;
+}
+#Panel, #PlayerCard, #DialogPanel, #ChoiceCard {
+    background: #FFFFFF;
+    border: 1px solid #DDE4EA;
+    border-radius: 10px;
+}
+#ChoiceCard:hover {
+    border-color: #8AC7BA;
+}
+#PlayerCard[active="true"] {
+    border: 1px solid #208F7B;
+    background: #EAF7F4;
+}
+#ModeLabel {
+    background: #F0F3F6;
+    color: #26313D;
+    border: 1px solid #DDE4EA;
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-weight: 800;
+}
+#LightAvatar, #DarkAvatar {
+    border-radius: 21px;
+    font-weight: 800;
+}
+#LightAvatar {
+    background: #F2F5F7;
+    color: #14181D;
+}
+#DarkAvatar {
+    background: #161A20;
+    color: #FFFFFF;
+}
+#PlayerName, #ChoiceTitle {
+    color: #111318;
+    font-size: 14px;
+    font-weight: 800;
+}
+#MutedLabel {
+    color: #687586;
+    font-size: 12px;
+}
+#MaterialLabel {
+    color: #208F7B;
+    font-weight: 800;
+}
+#SectionLabel {
+    color: #111318;
+    font-size: 13px;
+    font-weight: 800;
+    padding-bottom: 2px;
+}
+#ClockLabel {
+    background: #F0F3F6;
+    color: #111318;
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 20px;
+    font-weight: 800;
+}
+#ClockLabel[active="true"] {
+    border: 1px solid #208F7B;
+}
+#ClockLabel[low="true"] {
+    color: #D7263D;
+}
+#StatusLabel {
+    background: #F0F3F6;
+    color: #1F2933;
+    border: 1px solid #DDE4EA;
+    border-radius: 10px;
+    padding: 9px 12px;
+    font-weight: 700;
+}
+#PillLabel {
+    background: #F0F3F6;
+    color: #687586;
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-weight: 700;
+}
+#PillLabel[thinking="true"] {
+    color: #166B5E;
+    background: #DDF3EE;
+}
+#MoveListWidget {
+    background: #F8FAFC;
+    alternate-background-color: #EEF3F6;
+    color: #14181D;
+    border: none;
+    border-radius: 8px;
+    selection-background-color: #BEE7DE;
+    selection-color: #101418;
+    font-size: 13px;
+}
+#MoveListWidget QHeaderView::section {
+    background: #EEF2F6;
+    color: #5A6776;
+    border: none;
+    padding: 6px;
+    font-size: 12px;
+    font-weight: 700;
+}
+#MoveListWidget::item {
+    padding: 5px 8px;
+    border-radius: 6px;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical {
+    background: #C8D1DA;
+    border-radius: 5px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QSplitter::handle {
+    background: transparent;
+    height: 8px;
+}
+QDialog, #SettingsDialog, #NewGameDialog {
+    background: #FFFFFF;
+    color: #151719;
+}
+#DialogTitle {
+    font-size: 22px;
+    font-weight: 900;
+}
+QComboBox, QCheckBox, QRadioButton, QTextEdit {
+    color: #151719;
+    background: #F8FAFC;
+    border: 1px solid #DDE4EA;
+    border-radius: 8px;
+    padding: 7px 9px;
+}
+QRadioButton, QCheckBox {
+    border: none;
+    background: transparent;
+}
+QComboBox:hover, QTextEdit:hover {
+    background: #EEF2F6;
+}
+QComboBox:focus, QTextEdit:focus {
+    border: 1px solid #208F7B;
+}
+QPushButton {
+    background: #208F7B;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-weight: 700;
+}
+QPushButton:hover {
+    background: #28A58E;
+}
+QPushButton:disabled {
+    background: #E6EBF0;
+    color: #8A96A3;
+}
+QStatusBar {
+    background: #FFFFFF;
+    color: #687586;
+    border-top: 1px solid #DDE4EA;
+}
+QTabWidget::pane {
+    border: 1px solid #DDE4EA;
+    border-radius: 10px;
+    background: #FFFFFF;
+}
+QTabBar::tab {
+    background: #EEF2F6;
+    color: #687586;
+    padding: 8px 14px;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+}
+QTabBar::tab:selected {
+    color: #FFFFFF;
+    background: #208F7B;
+}
+)";
+}
+
+void appendLe16(QByteArray& data, qint16 value)
+{
+    data.append(static_cast<char>(value & 0xFF));
+    data.append(static_cast<char>((value >> 8) & 0xFF));
+}
+
+void appendLe32(QByteArray& data, quint32 value)
+{
+    data.append(static_cast<char>(value & 0xFF));
+    data.append(static_cast<char>((value >> 8) & 0xFF));
+    data.append(static_cast<char>((value >> 16) & 0xFF));
+    data.append(static_cast<char>((value >> 24) & 0xFF));
 }
 
 } // namespace
@@ -39,557 +593,766 @@ QString iconPathForPiece(Piece piece)
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
-    ui.setupUi(this);
+    m_appSettings = AppSettings::load();
+    m_engineController = new EngineController(this);
 
-    QWidget* central = new QWidget(this);
-    setCentralWidget(central);
+    buildInterface();
+    setupSounds();
+    applyTheme();
+    startGame(m_appSettings.game);
 
-    QHBoxLayout* mainLayout = new QHBoxLayout(central);
-
-    QVBoxLayout* leftPanel = new QVBoxLayout();
-    leftPanel->setContentsMargins(8, 8, 8, 8);
-    leftPanel->setSpacing(6);
-
-    QWidget* leftWidget = new QWidget();
-    leftWidget->setLayout(leftPanel);
-    leftWidget->setFixedWidth(150);
-    mainLayout->addWidget(leftWidget);
-
-    QHBoxLayout* buttonLayout = new QHBoxLayout();
-    QPushButton* undoBtn = new QPushButton("Undo", this);
-    QPushButton* redoBtn = new QPushButton("Redo", this);
-    undoBtn->setFixedSize(50, 30);
-    redoBtn->setFixedSize(50, 30);
-    undoBtn->setStyleSheet("font-weight: bold; font-size: 14px;");
-    redoBtn->setStyleSheet("font-weight: bold; font-size: 14px;");
-
-    buttonLayout->addWidget(undoBtn);
-    buttonLayout->addWidget(redoBtn);
-    leftPanel->addLayout(buttonLayout);
-
-    QLabel* historyLabel = new QLabel("Move History", this);
-    historyLabel->setStyleSheet("font-weight: bold; font-size: 14px;");
-    historyLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    leftPanel->addWidget(historyLabel);
-
-    moveHistoryList = new QListWidget(this);
-    moveHistoryList->setFixedWidth(134);
-    moveHistoryList->setStyleSheet(
-        "font-size: 13px; padding-left: 6px; padding-top: 4px; padding-bottom: 4px;"
-    );
-    moveHistoryList->setFrameShape(QFrame::StyledPanel);
-    moveHistoryList->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
-
-    QHBoxLayout* historyCenter = new QHBoxLayout();
-    historyCenter->setContentsMargins(0, 0, 0, 0);
-    historyCenter->addStretch();
-    historyCenter->addWidget(moveHistoryList);
-    historyCenter->addStretch();
-    leftPanel->addLayout(historyCenter);
-    leftPanel->addStretch();
-
-    connect(undoBtn, &QPushButton::clicked, this, &MainWindow::undoMove);
-    connect(redoBtn, &QPushButton::clicked, this, &MainWindow::redoMove);
-
-    QVBoxLayout* centerPanel = new QVBoxLayout();
-    mainLayout->addLayout(centerPanel);
-
-    turnLabel = new QLabel("White's Turn", this);
-    turnLabel->setAlignment(Qt::AlignCenter);
-    turnLabel->setStyleSheet("font-size: 18px; font-weight: bold;");
-    centerPanel->addWidget(turnLabel, 0, Qt::AlignHCenter);
-
-    QWidget* boardWithLabels = new QWidget(this);
-    QGridLayout* outerGrid = new QGridLayout(boardWithLabels);
-    outerGrid->setSpacing(0);
-    outerGrid->setContentsMargins(0, 0, 0, 0);
-
-    for (int r = 0; r < 8; r++) {
-        QLabel* rank = new QLabel(QString::number(8 - r));
-        rank->setAlignment(Qt::AlignCenter);
-        rank->setStyleSheet("font-size: 14px; font-weight: bold;");
-        rank->setFixedSize(20, 80);
-        outerGrid->addWidget(rank, r, 0);
-    }
-
-    for (int c = 0; c < 8; c++) {
-        QLabel* file = new QLabel(QString(QChar('A' + c)));
-        file->setAlignment(Qt::AlignCenter);
-        file->setStyleSheet("font-size: 14px; font-weight: bold;");
-        file->setFixedSize(80, 20);
-        outerGrid->addWidget(file, 8, c + 1);
-    }
-
-    QWidget* boardWidget = new QWidget(this);
-    boardWidget->setFixedSize(640, 640);
-
-    QGridLayout* grid = new QGridLayout(boardWidget);
-    grid->setSpacing(0);
-    grid->setContentsMargins(0, 0, 0, 0);
-
-    for (int row = 0; row < 8; ++row) {
-        for (int col = 0; col < 8; ++col) {
-            QPushButton* tile = new QPushButton(this);
-            QString color = ((row + col) % 2 == 0) ? "#EEEED2" : "#769656";
-            tile->setFixedSize(80, 80);
-            tile->setIconSize(QSize(80, 80));
-            tile->setStyleSheet(
-                "background-color:" + color +
-                "; border: none; padding: 0px; margin: 0px;"
-            );
-            grid->addWidget(tile, row, col);
-            boardButtons[row][col] = tile;
-
-            connect(tile, &QPushButton::clicked, this, [=]() {
-                selectedSquare = row * 8 + col;
-                handleTileClick();
-                });
-        }
-    }
-
-    outerGrid->addWidget(boardWidget, 0, 1, 8, 8);
-    centerPanel->addWidget(boardWithLabels, 0, Qt::AlignHCenter);
-    centerPanel->addStretch();
-
-    QVBoxLayout* rightPanel = new QVBoxLayout();
-    QWidget* rightWidget = new QWidget();
-    rightWidget->setLayout(rightPanel);
-    rightWidget->setFixedWidth(120);
-    mainLayout->addWidget(rightWidget);
-
-    QPushButton* pushie = new QPushButton("Calculate Moves", this);
-    pushie->setFixedSize(50, 30);
-    pushie->setStyleSheet("font-weight: bold; font-size: 14px;");
-    rightPanel->addWidget(pushie);
-    connect(pushie, &QPushButton::clicked, this, &MainWindow::CalculateMoves);
-
-    engine.newGame();
-    updateBoardUI();
-
-    positionHistory.clear();
-    repetitionHistory.clear();
-    moveHistory.clear();
-    recordCurrentPosition();
-    currentMoveIndex = 0;
-    moveHistoryList->clear();
-
-    connect(moveHistoryList, &QListWidget::currentRowChanged,
-        this, &MainWindow::onHistoryItemSelected);
-
-    QShortcut* undoShortcut = new QShortcut(QKeySequence("Ctrl+Z"), this);
-    connect(undoShortcut, &QShortcut::activated, this, &MainWindow::undoMove);
-
-    QShortcut* redoShortcut = new QShortcut(QKeySequence("Ctrl+Y"), this);
-    connect(redoShortcut, &QShortcut::activated, this, &MainWindow::redoMove);
+    connect(&m_clockTimer, &QTimer::timeout, this, &MainWindow::updateClocks);
+    m_clockTimer.start(100);
 }
 
-MainWindow::~MainWindow() = default;
-
-void MainWindow::handleTileClick()
+MainWindow::~MainWindow()
 {
-    static int fromRow = -1;
-    static int fromCol = -1;
+    m_engine.stopSearch();
+}
 
-    if (!pieceSelected) {
-        Piece piece = engine.pieceAt(selectedSquare);
-        if (piece == EMPTY) {
-            return;
-        }
+void MainWindow::buildInterface()
+{
+    setWindowTitle("Chess");
+    resize(1280, 820);
+    setMinimumSize(1040, 700);
+    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
 
-        if (engine.isWhiteTurn() != isWhitePiece(piece)) {
-            return;
-        }
+    m_stack = new QStackedWidget(this);
+    setCentralWidget(m_stack);
 
-        pieceSelected = true;
-        fromRow = selectedSquare / 8;
-        fromCol = selectedSquare % 8;
+    auto* gamePage = new QWidget(this);
+    gamePage->setObjectName("CentralShell");
+    auto* root = new QVBoxLayout(gamePage);
+    root->setContentsMargins(18, 18, 18, 18);
+    root->setSpacing(12);
 
-        boardButtons[fromRow][fromCol]->setStyleSheet("background-color: yellow; border: none;");
+    auto* boardStage = new QWidget(gamePage);
+    boardStage->setObjectName("BoardStage");
+    auto* boardLayout = new QVBoxLayout(boardStage);
+    boardLayout->setContentsMargins(16, 14, 16, 16);
+    boardLayout->setSpacing(10);
 
-        std::vector<Move> moves = engine.legalMoves();
-        std::vector<Move> fromSquareMoves;
-        for (const Move& move : moves) {
-            if (move.from == selectedSquare) {
-                fromSquareMoves.push_back(move);
-            }
-        }
-        highlightMoves(fromSquareMoves);
+    m_centerStatus = new QLabel(boardStage);
+    m_centerStatus->setObjectName("CenterStatus");
+    m_centerStatus->setAlignment(Qt::AlignCenter);
+    boardLayout->addWidget(m_centerStatus);
+
+    m_board = new ChessBoardWidget(boardStage);
+    boardLayout->addWidget(m_board, 1);
+    root->addWidget(boardStage, 1);
+    m_stack->addWidget(gamePage);
+
+    connect(m_board, &ChessBoardWidget::squareClicked, this, &MainWindow::handleSquareClicked);
+    connect(m_board, &ChessBoardWidget::dragStarted, this, &MainWindow::handleDragStarted);
+    connect(m_board, &ChessBoardWidget::moveRequested, this, &MainWindow::handleMoveRequested);
+    connect(m_board, &ChessBoardWidget::moveAnimationStarted, this, [this]() {
+        m_moveAnimationInProgress = true;
+        updateBoardInputState();
+    });
+    connect(m_board, &ChessBoardWidget::moveAnimationFinished, this, [this]() {
+        m_moveAnimationInProgress = false;
+        updateBoardInputState();
+        maybeStartEngineTurn();
+    });
+    connect(m_engineController, &EngineController::searchStarted,
+            this, &MainWindow::handleEngineSearchStarted);
+    connect(m_engineController, &EngineController::searchFinished,
+            this, &MainWindow::handleEngineSearchFinished);
+
+    buildToolbar();
+    buildSidebarDock();
+    buildBottomDock();
+    statusBar()->showMessage("Ready");
+
+    auto* redoAltShortcut = new QShortcut(QKeySequence("Ctrl+Shift+Z"), this);
+    connect(redoAltShortcut, &QShortcut::activated, this, &MainWindow::redoMove);
+    auto* previousMoveShortcut = new QShortcut(QKeySequence(Qt::Key_Left), this);
+    connect(previousMoveShortcut, &QShortcut::activated, this, &MainWindow::undoMove);
+    auto* nextMoveShortcut = new QShortcut(QKeySequence(Qt::Key_Right), this);
+    connect(nextMoveShortcut, &QShortcut::activated, this, &MainWindow::redoMove);
+}
+
+void MainWindow::buildToolbar()
+{
+    auto* toolbar = addToolBar("Controls");
+    toolbar->setMovable(false);
+    toolbar->setFloatable(false);
+    toolbar->setIconSize(QSize(22, 22));
+    toolbar->setToolButtonStyle(Qt::ToolButtonIconOnly);
+
+    m_newGameAction = toolbar->addAction(QIcon(":/icons/new-game.svg"), "New Game");
+    m_newGameAction->setShortcut(QKeySequence("Ctrl+N"));
+    m_newGameAction->setToolTip("New Game (Ctrl+N)");
+    m_newGameAction->setStatusTip("Choose a game mode and start a fresh game.");
+
+    m_undoAction = toolbar->addAction(QIcon(":/icons/undo.svg"), "Undo");
+    m_undoAction->setShortcut(QKeySequence("Ctrl+Z"));
+    m_undoAction->setToolTip("Undo (Ctrl+Z)");
+    m_undoAction->setStatusTip("Go back one move.");
+
+    m_redoAction = toolbar->addAction(QIcon(":/icons/redo.svg"), "Redo");
+    m_redoAction->setShortcut(QKeySequence("Ctrl+Y"));
+    m_redoAction->setToolTip("Redo (Ctrl+Y)");
+    m_redoAction->setStatusTip("Go forward one move.");
+
+    toolbar->addSeparator();
+
+    m_flipAction = toolbar->addAction(QIcon(":/icons/flip.svg"), "Flip Board");
+    m_flipAction->setShortcut(QKeySequence("Ctrl+F"));
+    m_flipAction->setToolTip("Flip Board (Ctrl+F)");
+    m_flipAction->setStatusTip("Rotate the board.");
+
+    m_analysisAction = toolbar->addAction(QIcon(":/icons/analysis.svg"), "Analysis");
+    m_analysisAction->setCheckable(true);
+    m_analysisAction->setToolTip("Show Analysis");
+    m_analysisAction->setStatusTip("Show or hide the analysis and chat panel.");
+
+    toolbar->addSeparator();
+
+    m_resignAction = toolbar->addAction(QIcon(":/icons/resign.svg"), "Resign");
+    m_resignAction->setToolTip("Resign");
+    m_resignAction->setStatusTip("Resign the current game.");
+
+    m_settingsAction = toolbar->addAction(QIcon(":/icons/settings.svg"), "Settings");
+    m_settingsAction->setShortcut(QKeySequence("Ctrl+,"));
+    m_settingsAction->setToolTip("Settings (Ctrl+,)");
+    m_settingsAction->setStatusTip("Open appearance, gameplay, and engine preferences.");
+
+    connect(m_newGameAction, &QAction::triggered, this, &MainWindow::newGame);
+    connect(m_undoAction, &QAction::triggered, this, &MainWindow::undoMove);
+    connect(m_redoAction, &QAction::triggered, this, &MainWindow::redoMove);
+    connect(m_resignAction, &QAction::triggered, this, &MainWindow::resignGame);
+    connect(m_settingsAction, &QAction::triggered, this, &MainWindow::openSettings);
+    connect(m_flipAction, &QAction::triggered, this, &MainWindow::flipBoard);
+    connect(m_analysisAction, &QAction::triggered, this, &MainWindow::toggleAnalysisDock);
+}
+
+void MainWindow::buildSidebarDock()
+{
+    m_sidebar = new SidebarWidget(this);
+    connect(m_sidebar, &SidebarWidget::positionRequested,
+            this, &MainWindow::handleHistoryPositionRequested);
+    connect(m_sidebar->moveListWidget(), &MoveListWidget::previousMoveRequested,
+            this, &MainWindow::undoMove);
+    connect(m_sidebar->moveListWidget(), &MoveListWidget::nextMoveRequested,
+            this, &MainWindow::redoMove);
+
+    m_sidebarDock = new QDockWidget("Game", this);
+    m_sidebarDock->setObjectName("GameDock");
+    m_sidebarDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    m_sidebarDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    m_sidebarDock->setWidget(m_sidebar);
+    addDockWidget(Qt::RightDockWidgetArea, m_sidebarDock);
+    resizeDocks(QList<QDockWidget*>{ m_sidebarDock }, QList<int>{ 360 }, Qt::Horizontal);
+    animatePanel(m_sidebar);
+}
+
+void MainWindow::buildBottomDock()
+{
+    auto* tabs = new QTabWidget(this);
+    tabs->setObjectName("BottomTabs");
+
+    auto* analysis = new QTextEdit(tabs);
+    analysis->setReadOnly(true);
+    analysis->setPlainText("Principal variation\nEvaluation\nDepth");
+    tabs->addTab(analysis, "Analysis");
+
+    auto* chat = new QTextEdit(tabs);
+    chat->setPlaceholderText("Multiplayer chat");
+    tabs->addTab(chat, "Chat");
+
+    auto* history = new QTextEdit(tabs);
+    history->setReadOnly(true);
+    history->setPlainText("Recent games");
+    tabs->addTab(history, "History");
+
+    m_bottomDock = new QDockWidget("Analysis", this);
+    m_bottomDock->setObjectName("AnalysisDock");
+    m_bottomDock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+    m_bottomDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    m_bottomDock->setWidget(tabs);
+    addDockWidget(Qt::BottomDockWidgetArea, m_bottomDock);
+    m_bottomDock->setVisible(m_appSettings.ui.showAnalysis);
+    m_analysisAction->setChecked(m_appSettings.ui.showAnalysis);
+}
+
+void MainWindow::applyTheme()
+{
+    qApp->setStyleSheet(m_appSettings.ui.darkTheme ? darkStyleSheet() : lightStyleSheet());
+    if (m_board) {
+        m_board->setCoordinatesVisible(m_appSettings.ui.coordinatesVisible);
+        m_board->setAnimationsEnabled(m_appSettings.ui.animationsEnabled);
+        m_board->setBoardTheme(m_appSettings.ui.boardTheme);
+    }
+}
+
+void MainWindow::animatePanel(QWidget* widget)
+{
+    auto* effect = new QGraphicsOpacityEffect(widget);
+    widget->setGraphicsEffect(effect);
+
+    auto* opacity = new QPropertyAnimation(effect, "opacity", widget);
+    opacity->setDuration(220);
+    opacity->setStartValue(0.0);
+    opacity->setEndValue(1.0);
+    opacity->setEasingCurve(QEasingCurve::OutCubic);
+    connect(opacity, &QPropertyAnimation::finished, widget, [widget]() {
+        widget->setGraphicsEffect(nullptr);
+    });
+    opacity->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
+void MainWindow::setupSounds()
+{
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + "/ChessQtAppSounds";
+    QDir().mkpath(base);
+
+    const QString movePath = base + "/move.wav";
+    const QString capturePath = base + "/capture.wav";
+    const QString checkPath = base + "/check.wav";
+    writeToneFile(movePath, 620, 70);
+    writeToneFile(capturePath, 360, 95);
+    writeToneFile(checkPath, 880, 120);
+
+    m_moveSound.setSource(QUrl::fromLocalFile(movePath));
+    m_captureSound.setSource(QUrl::fromLocalFile(capturePath));
+    m_checkSound.setSource(QUrl::fromLocalFile(checkPath));
+    m_moveSound.setVolume(0.24f);
+    m_captureSound.setVolume(0.28f);
+    m_checkSound.setVolume(0.30f);
+}
+
+void MainWindow::writeToneFile(const QString& path, int frequency, int durationMs)
+{
+    if (QFile::exists(path)) {
         return;
     }
 
-    bool valid = false;
-    Move selectedMove;
-    clearHighlights();
+    constexpr int sampleRate = 44100;
+    constexpr int channels = 1;
+    constexpr int bitsPerSample = 16;
+    const int samples = sampleRate * durationMs / 1000;
+    const int dataBytes = samples * channels * bitsPerSample / 8;
 
-    int fromSquare = fromRow * 8 + fromCol;
-    std::vector<Move> legalMoves = engine.legalMoves();
-    for (const Move& move : legalMoves) {
-        if (move.from == fromSquare && move.to == selectedSquare) {
-            selectedMove = move;
-            valid = true;
-            break;
-        }
+    QByteArray wav;
+    wav.append("RIFF", 4);
+    appendLe32(wav, 36 + dataBytes);
+    wav.append("WAVE", 4);
+    wav.append("fmt ", 4);
+    appendLe32(wav, 16);
+    appendLe16(wav, 1);
+    appendLe16(wav, channels);
+    appendLe32(wav, sampleRate);
+    appendLe32(wav, sampleRate * channels * bitsPerSample / 8);
+    appendLe16(wav, channels * bitsPerSample / 8);
+    appendLe16(wav, bitsPerSample);
+    wav.append("data", 4);
+    appendLe32(wav, dataBytes);
+
+    for (int i = 0; i < samples; ++i) {
+        const double t = static_cast<double>(i) / sampleRate;
+        const double fadeIn = std::min(1.0, i / 220.0);
+        const double fadeOut = std::min(1.0, (samples - i) / 500.0);
+        const double envelope = std::min(fadeIn, fadeOut);
+        const auto sample = static_cast<qint16>(std::sin(2.0 * 3.14159265358979323846 * frequency * t) *
+                                                32767.0 * 0.22 * envelope);
+        appendLe16(wav, sample);
     }
 
-    resetColors();
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly)) {
+        file.write(wav);
+    }
+}
 
-    if (!valid) {
-        pieceSelected = false;
-        fromRow = fromCol = -1;
+void MainWindow::newGame()
+{
+    NewGameDialog dialog(m_appSettings.game, this);
+    if (dialog.exec() != QDialog::Accepted) {
         return;
     }
 
-    truncateHistory();
+    m_appSettings.game = dialog.gameSettings();
+    m_appSettings.game.engineDifficulty = m_appSettings.game.gameMode == GameMode::HumanVsEngine
+        ? m_appSettings.game.engineDifficulty
+        : m_appSettings.ui.defaultEngineDifficulty;
+    m_appSettings.save();
+    startGame(m_appSettings.game);
+}
 
-    bool humanWasWhite = engine.isWhiteTurn();
-    QString humanSan = QString::fromStdString(engine.moveToSan(selectedMove));
-    if (!engine.makeMove(selectedMove)) {
-        pieceSelected = false;
-        fromRow = fromCol = -1;
-        return;
+void MainWindow::startGame(const GameSettings& settings)
+{
+    ++m_gameGeneration;
+    m_engineThinking = false;
+    m_moveAnimationInProgress = false;
+    m_gameFinished = false;
+    m_selectedSquare = -1;
+    m_lastFrom = -1;
+    m_lastTo = -1;
+    m_lastSearchDepth = 0;
+    m_lastSearchMoveTimeMs = 0;
+
+    m_appSettings.game = settings;
+    if (m_appSettings.game.gameMode == GameMode::HumanVsEngine && m_appSettings.game.playerSide == PlayerSide::Random) {
+        m_resolvedHumanSide = QRandomGenerator::global()->bounded(2) == 0 ? PlayerSide::White : PlayerSide::Black;
+    }
+    else if (m_appSettings.game.playerSide == PlayerSide::Black) {
+        m_resolvedHumanSide = PlayerSide::Black;
+    }
+    else {
+        m_resolvedHumanSide = PlayerSide::White;
     }
 
-    updateBoardUI();
-    lastFrom = selectedMove.from;
-    lastTo = selectedMove.to;
-    highlightLastMove();
-
-    moveHistory.push_back(selectedMove);
+    m_engine.newGame();
+    m_positionHistory.clear();
+    m_repetitionHistory.clear();
+    m_moveHistory.clear();
+    m_currentMoveIndex = 0;
     recordCurrentPosition();
-    currentMoveIndex = static_cast<int>(positionHistory.size()) - 1;
-    addMoveToHistory(humanWasWhite, humanSan);
-    moveHistoryList->setCurrentRow((currentMoveIndex - 1) / 2);
 
-    if (checkDrawByRepetitionOr50() || updateGameStatusLabel()) {
-        pieceSelected = false;
-        fromRow = fromCol = -1;
-        return;
-    }
+    m_sidebar->clearMoves();
+    m_sidebar->setThinking(false);
+    m_sidebar->setSearchSummary("Ready");
+    m_sidebar->setEvaluation(0.0);
+    m_sidebar->setMaterialSummary(0, 0);
+    m_board->clearLastMove();
+    m_board->clearSelection();
+    m_board->setCheckSquare(-1);
+    m_board->setPosition(boardSnapshot());
+    m_board->setBoardFlipped(m_appSettings.game.gameMode == GameMode::HumanVsEngine &&
+                             m_resolvedHumanSide == PlayerSide::Black);
 
-    qDebug() << "Engine is thinking...";
-    setEnabled(false);
-    auto start = std::chrono::high_resolution_clock::now();
-    std::vector<uint64_t> repetitions = repetitionHistory;
-
-    QFuture<chess::SearchResult> future = QtConcurrent::run(
-        [this, repetitions]() {
-            chess::SearchLimits limits;
-            limits.maxDepth = 128;
-            limits.moveTimeMs = 1000;
-            engine.clearSearchStop();
-            return engine.findBestMove(limits, repetitions);
-        });
-
-    QFutureWatcher<chess::SearchResult>* watcher = new QFutureWatcher<chess::SearchResult>(this);
-
-    connect(watcher, &QFutureWatcher<chess::SearchResult>::finished, this, [=]() {
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        qDebug() << "Engine move found in" << elapsed.count() << "seconds.";
-
-        chess::SearchResult result = watcher->future().result();
-        Move engineMove = result.bestMove;
-
-        if (engineMove.from == -1) {
-            turnLabel->setText("Engine lost");
-            pieceSelected = false;
-            fromRow = fromCol = -1;
-            setEnabled(true);
-            watcher->deleteLater();
-            return;
-        }
-
-        bool engineWasWhite = engine.isWhiteTurn();
-        QString engineSan = QString::fromStdString(engine.moveToSan(engineMove));
-        if (!engine.makeMove(engineMove)) {
-            turnLabel->setText("Engine returned illegal move");
-            pieceSelected = false;
-            fromRow = fromCol = -1;
-            setEnabled(true);
-            watcher->deleteLater();
-            return;
-        }
-
-        updateBoardUI();
-        lastFrom = engineMove.from;
-        lastTo = engineMove.to;
-        highlightLastMove();
-
-        moveHistory.push_back(engineMove);
-        recordCurrentPosition();
-        currentMoveIndex = static_cast<int>(positionHistory.size()) - 1;
-        addMoveToHistory(engineWasWhite, engineSan);
-        moveHistoryList->setCurrentRow((currentMoveIndex - 1) / 2);
-
-        if (!checkDrawByRepetitionOr50()) {
-            updateGameStatusLabel();
-        }
-
-        setEnabled(true);
-        watcher->deleteLater();
-        });
-
-    watcher->setFuture(future);
-    turnLabel->setText("Engine is thinking...");
-
-    pieceSelected = false;
-    fromRow = fromCol = -1;
+    resetClocks();
+    updateModeStatus();
+    updateGameStatusViews();
+    updateActionStates();
+    updateBoardInputState();
+    statusBar()->showMessage(modeStatusText());
+    maybeStartEngineTurn();
 }
 
 void MainWindow::undoMove()
 {
-    if (currentMoveIndex == 0) {
+    if (m_engineThinking || m_moveAnimationInProgress || m_currentMoveIndex == 0) {
         return;
     }
-
-    restorePosition(currentMoveIndex - 1);
-
-    int moveNum = currentMoveIndex / 2;
-    moveHistoryList->setCurrentRow(moveNum - 1);
+    restorePosition(m_currentMoveIndex - 1);
 }
 
 void MainWindow::redoMove()
 {
-    if (currentMoveIndex + 1 >= static_cast<int>(positionHistory.size())) {
+    if (m_engineThinking || m_moveAnimationInProgress || m_currentMoveIndex + 1 >= static_cast<int>(m_positionHistory.size())) {
+        return;
+    }
+    restorePosition(m_currentMoveIndex + 1);
+}
+
+void MainWindow::resignGame()
+{
+    if (m_gameFinished || m_engineThinking) {
         return;
     }
 
-    restorePosition(currentMoveIndex + 1);
-
-    int moveNum = currentMoveIndex / 2;
-    moveHistoryList->setCurrentRow(moveNum - 1);
-}
-
-void MainWindow::updateBoardUI()
-{
-    for (int row = 0; row < 8; ++row) {
-        for (int col = 0; col < 8; ++col) {
-            int square = row * 8 + col;
-            QString iconPath = iconPathForPiece(engine.pieceAt(square));
-
-            if (!iconPath.isEmpty()) {
-                QIcon icon(iconPath);
-                boardButtons[row][col]->setIcon(icon);
-                boardButtons[row][col]->setIconSize(boardButtons[row][col]->size());
-            }
-            else {
-                boardButtons[row][col]->setIcon(QIcon());
-            }
+    if (m_appSettings.ui.confirmResign) {
+        const auto answer = QMessageBox::question(this, "Resign", "Resign the current game?");
+        if (answer != QMessageBox::Yes) {
+            return;
         }
     }
 
-    turnLabel->setText(engine.isWhiteTurn() ? "White's Turn" : "Black's Turn");
+    m_gameFinished = true;
+    const QString status = m_engine.isWhiteTurn() ? "White resigned" : "Black resigned";
+    m_centerStatus->setText(status);
+    m_sidebar->setStatusText(status);
+    updateBoardInputState();
+    updateActionStates();
 }
 
-void MainWindow::resetColors()
+void MainWindow::openSettings()
 {
-    for (int r = 0; r < 8; ++r) {
-        for (int c = 0; c < 8; ++c) {
-            QString color = ((r + c) % 2 == 0) ? "#EEEED2" : "#769656";
-            boardButtons[r][c]->setStyleSheet("background-color:" + color + "; border: none;");
-        }
-    }
-}
-
-void MainWindow::highlightMoves(const std::vector<Move>& moves)
-{
-    clearHighlights();
-
-    for (const Move& move : moves) {
-        int square = move.to;
-        int r = square / 8;
-        int c = square % 8;
-        QWidget* overlay = new QWidget(boardButtons[r][c]);
-        overlay->setAttribute(Qt::WA_TransparentForMouseEvents);
-        overlay->setGeometry(0, 0, 80, 80);
-
-        bool isCapture = engine.pieceAt(square) != EMPTY || move.wasEnPassant;
-        if (!isCapture) {
-            QWidget* dot = new QWidget(overlay);
-            dot->setAttribute(Qt::WA_TransparentForMouseEvents);
-            dot->setFixedSize(22, 22);
-            dot->move((80 - 22) / 2, (80 - 22) / 2);
-            dot->setStyleSheet(
-                "background-color: rgba(0,0,0,50);"
-                "border-radius: 11px;"
-                "border: none;"
-            );
-            dot->show();
-        }
-        else {
-            overlay->setStyleSheet("background-color: transparent;");
-            overlay->setFixedSize(80, 80);
-            overlay->move(0, 0);
-            overlay->installEventFilter(this);
-        }
-
-        overlay->show();
-        highlightOverlays.push_back(overlay);
-    }
-}
-
-void MainWindow::clearHighlights()
-{
-    for (QWidget* widget : highlightOverlays) {
-        widget->deleteLater();
-    }
-    highlightOverlays.clear();
-}
-
-bool MainWindow::eventFilter(QObject* obj, QEvent* event)
-{
-    if (event->type() == QEvent::Paint) {
-        QWidget* widget = qobject_cast<QWidget*>(obj);
-        if (!widget) {
-            return false;
-        }
-
-        QPainter painter(widget);
-        painter.setRenderHint(QPainter::Antialiasing, true);
-
-        QPen pen(QColor(0, 0, 0, 50));
-        pen.setWidth(6);
-        painter.setPen(pen);
-        painter.setBrush(Qt::NoBrush);
-        painter.drawEllipse(QPoint(widget->width() / 2, widget->height() / 2), 35, 35);
-    }
-    return false;
-}
-
-void MainWindow::CalculateMoves()
-{
-    qDebug() << "Starting Perft Test";
-
-    int depth = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    chess::PerftResult result = engine.perft(depth);
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> elapsed = end - start;
-    qDebug() << "Perft(" << depth << ") nodes:" << result.nodes;
-    qDebug() << "Time:" << elapsed.count() << "seconds";
-}
-
-void MainWindow::onHistoryItemSelected(int row)
-{
-    if (row < 0) {
+    SettingsDialog dialog(m_appSettings.ui, this);
+    if (dialog.exec() != QDialog::Accepted) {
         return;
     }
 
-    int posIndex = (row + 1) * 2;
-    if (posIndex > static_cast<int>(positionHistory.size()) - 1) {
-        posIndex = static_cast<int>(positionHistory.size()) - 1;
+    m_appSettings.ui = dialog.preferences();
+    if (m_appSettings.game.gameMode == GameMode::HumanVsEngine) {
+        m_appSettings.game.engineDifficulty = m_appSettings.ui.defaultEngineDifficulty;
+    }
+    m_appSettings.save();
+    applyTheme();
+    if (m_bottomDock) {
+        m_bottomDock->setVisible(m_appSettings.ui.showAnalysis);
+        m_analysisAction->setChecked(m_appSettings.ui.showAnalysis);
+    }
+    updateModeStatus();
+    updateGameStatusViews();
+}
+
+void MainWindow::flipBoard()
+{
+    m_board->setBoardFlipped(!m_board->isBoardFlipped());
+}
+
+void MainWindow::toggleAnalysisDock()
+{
+    const bool show = m_analysisAction->isChecked();
+    m_bottomDock->setVisible(show);
+    m_appSettings.ui.showAnalysis = show;
+    m_appSettings.save();
+    if (show) {
+        animatePanel(m_bottomDock->widget());
+    }
+}
+
+void MainWindow::updateBoardInputState()
+{
+    m_board->setBoardInputEnabled(isBoardInputAllowed());
+}
+
+void MainWindow::updateActionStates()
+{
+    m_newGameAction->setEnabled(true);
+    m_undoAction->setEnabled(!m_engineThinking && !m_moveAnimationInProgress && m_currentMoveIndex > 0);
+    m_redoAction->setEnabled(!m_engineThinking &&
+                             !m_moveAnimationInProgress &&
+                             m_currentMoveIndex + 1 < static_cast<int>(m_positionHistory.size()));
+    m_resignAction->setEnabled(!m_engineThinking && !m_gameFinished);
+    m_flipAction->setEnabled(true);
+    m_settingsAction->setEnabled(true);
+}
+
+bool MainWindow::isBoardInputAllowed() const
+{
+    return !m_engineThinking &&
+           !m_moveAnimationInProgress &&
+           !m_gameFinished &&
+           isLatestPosition() &&
+           isHumanSideToMove();
+}
+
+bool MainWindow::isEngineTurn() const
+{
+    if (m_appSettings.game.gameMode != GameMode::HumanVsEngine) {
+        return false;
     }
 
-    restorePosition(posIndex);
+    const bool humanIsWhite = m_resolvedHumanSide == PlayerSide::White;
+    return m_engine.isWhiteTurn() != humanIsWhite;
 }
 
-void MainWindow::recordCurrentPosition()
+bool MainWindow::isHumanSideToMove() const
 {
-    positionHistory.push_back(engine.currentFen());
-    repetitionHistory.push_back(engine.positionHash());
+    if (m_appSettings.game.gameMode == GameMode::HumanVsHuman) {
+        return true;
+    }
+    return !isEngineTurn();
 }
 
-void MainWindow::restorePosition(int positionIndex)
+bool MainWindow::isLatestPosition() const
 {
-    if (positionIndex < 0 || positionIndex >= static_cast<int>(positionHistory.size())) {
+    return !m_positionHistory.empty() &&
+           m_currentMoveIndex == static_cast<int>(m_positionHistory.size()) - 1;
+}
+
+void MainWindow::maybeStartEngineTurn()
+{
+    if (m_appSettings.game.gameMode != GameMode::HumanVsEngine ||
+        m_gameFinished ||
+        m_engineThinking ||
+        m_moveAnimationInProgress ||
+        !isLatestPosition() ||
+        !isEngineTurn()) {
+        updateBoardInputState();
+        updateActionStates();
         return;
     }
 
-    currentMoveIndex = positionIndex;
-    engine.setPositionFromFen(positionHistory[currentMoveIndex]);
-    updateBoardUI();
+    m_engineController->startSearch(m_engine.currentFen(),
+                                    m_repetitionHistory,
+                                    m_appSettings.game.engineDifficulty,
+                                    m_gameGeneration);
+}
 
-    if (currentMoveIndex > 0 && currentMoveIndex - 1 < static_cast<int>(moveHistory.size())) {
-        lastFrom = moveHistory[currentMoveIndex - 1].from;
-        lastTo = moveHistory[currentMoveIndex - 1].to;
-        highlightLastMove();
+void MainWindow::handleEngineSearchStarted(int generation)
+{
+    if (generation != m_gameGeneration) {
+        return;
+    }
+
+    m_engineThinking = true;
+    if (m_appSettings.ui.showThinkingIndicator) {
+        m_sidebar->setThinking(true);
+    }
+    m_sidebar->setSearchSummary(QString("Searching\nDepth: %1\nLevel: %2")
+                                .arg(difficultyDepth(m_appSettings.game.engineDifficulty))
+                                .arg(difficultyText(m_appSettings.game.engineDifficulty)));
+    m_centerStatus->setText("Engine thinking...");
+    statusBar()->showMessage("Engine thinking...");
+    updateBoardInputState();
+    updateActionStates();
+}
+
+void MainWindow::handleEngineSearchFinished(int generation,
+                                            Move bestMove,
+                                            long long nodes,
+                                            long long leafNodes,
+                                            int depth,
+                                            int moveTimeMs)
+{
+    if (generation != m_gameGeneration) {
+        return;
+    }
+
+    m_engineThinking = false;
+    m_sidebar->setThinking(false);
+    m_lastSearchDepth = depth;
+    m_lastSearchMoveTimeMs = moveTimeMs;
+
+    if (bestMove.from == -1 || !isEngineTurn()) {
+        m_gameFinished = true;
+        m_centerStatus->setText("Engine has no legal move");
+        m_sidebar->setStatusText("Engine has no legal move");
+        updateBoardInputState();
+        updateActionStates();
+        return;
+    }
+
+    const bool engineWasWhite = m_engine.isWhiteTurn();
+    const QString san = QString::fromStdString(m_engine.moveToSan(bestMove));
+    const QString uci = moveText(bestMove);
+    if (!m_engine.makeMove(bestMove)) {
+        m_gameFinished = true;
+        m_centerStatus->setText("Engine returned an illegal move");
+        m_sidebar->setStatusText("Engine returned an illegal move");
+        updateBoardInputState();
+        updateActionStates();
+        return;
+    }
+
+    m_sidebar->setSearchSummary(QString("Best: %1\nNodes: %2\nLeaf nodes: %3\nTime: %4 ms")
+                                .arg(uci)
+                                .arg(nodes)
+                                .arg(leafNodes)
+                                .arg(moveTimeMs));
+    completeMove(bestMove, engineWasWhite, san, true);
+    statusBar()->showMessage(modeStatusText());
+}
+
+void MainWindow::handleSquareClicked(int square)
+{
+    if (!isBoardInputAllowed()) {
+        return;
+    }
+
+    if (m_selectedSquare == -1) {
+        selectSquare(square);
+        return;
+    }
+
+    if (square == m_selectedSquare) {
+        clearSelection();
+        return;
+    }
+
+    if (tryMakeMove(m_selectedSquare, square)) {
+        return;
+    }
+
+    selectSquare(square);
+}
+
+void MainWindow::handleDragStarted(int square)
+{
+    if (isBoardInputAllowed()) {
+        selectSquare(square);
+    }
+}
+
+void MainWindow::handleMoveRequested(int from, int to)
+{
+    if (!isBoardInputAllowed()) {
+        return;
+    }
+
+    if (!tryMakeMove(from, to)) {
+        clearSelection();
+    }
+}
+
+void MainWindow::handleHistoryPositionRequested(int positionIndex)
+{
+    if (m_engineThinking || positionIndex < 0) {
+        return;
+    }
+    restorePosition(std::min(positionIndex, static_cast<int>(m_positionHistory.size()) - 1));
+}
+
+void MainWindow::selectSquare(int square)
+{
+    if (!isBoardInputAllowed() || square < 0 || square >= 64) {
+        clearSelection();
+        return;
+    }
+
+    const Piece piece = m_engine.pieceAt(square);
+    if (piece == EMPTY || isWhitePiece(piece) != m_engine.isWhiteTurn()) {
+        clearSelection();
+        return;
+    }
+
+    m_selectedSquare = square;
+    m_board->setSelectedSquare(square);
+    if (m_appSettings.ui.legalMoveHints) {
+        m_board->setLegalMoves(legalMovesFrom(square));
+    }
+}
+
+void MainWindow::clearSelection()
+{
+    m_selectedSquare = -1;
+    m_board->clearSelection();
+}
+
+std::vector<Move> MainWindow::legalMovesFrom(int square) const
+{
+    std::vector<Move> moves;
+    for (const Move& move : m_engine.legalMoves()) {
+        if (move.from == square) {
+            moves.push_back(move);
+        }
+    }
+    return moves;
+}
+
+bool MainWindow::tryMakeMove(int from, int to)
+{
+    if (!isBoardInputAllowed()) {
+        return false;
+    }
+
+    Move selectedMove;
+    bool valid = false;
+    for (const Move& move : m_engine.legalMoves()) {
+        if (move.from != from || move.to != to) {
+            continue;
+        }
+
+        selectedMove = move;
+        valid = true;
+        if (!move.wasPromotion || m_appSettings.ui.autoQueenPromotion || move.promotedTo == WQ || move.promotedTo == BQ) {
+            break;
+        }
+    }
+
+    if (!valid) {
+        return false;
+    }
+
+    truncateHistory();
+    const bool whiteMove = m_engine.isWhiteTurn();
+    const QString san = QString::fromStdString(m_engine.moveToSan(selectedMove));
+    if (!m_engine.makeMove(selectedMove)) {
+        clearSelection();
+        return false;
+    }
+
+    completeMove(selectedMove, whiteMove, san, true);
+    return true;
+}
+
+void MainWindow::completeMove(const Move& move, bool whiteMove, const QString& san, bool animate)
+{
+    clearSelection();
+    m_lastFrom = move.from;
+    m_lastTo = move.to;
+    refreshBoard(animate, move.from, move.to);
+
+    m_moveHistory.push_back(move);
+    recordCurrentPosition();
+    m_currentMoveIndex = static_cast<int>(m_positionHistory.size()) - 1;
+    addMoveToHistory(whiteMove, san);
+    m_sidebar->setCurrentPly(m_currentMoveIndex);
+    playMoveFeedback(move);
+    updateGameStatusViews();
+
+    if (!checkDrawByRepetitionOr50()) {
+        updateGameStatusLabel();
+    }
+
+    updateBoardInputState();
+    updateActionStates();
+    maybeStartEngineTurn();
+}
+
+std::array<Piece, 64> MainWindow::boardSnapshot() const
+{
+    std::array<Piece, 64> snapshot{};
+    for (int square = 0; square < 64; ++square) {
+        snapshot[square] = m_engine.pieceAt(square);
+    }
+    return snapshot;
+}
+
+void MainWindow::refreshBoard(bool animate, int from, int to)
+{
+    const std::array<Piece, 64> snapshot = boardSnapshot();
+    if (from >= 0 && to >= 0) {
+        m_board->setLastMove(from, to);
     }
     else {
-        lastFrom = -1;
-        lastTo = -1;
-        resetColors();
+        m_board->clearLastMove();
     }
 
+    m_board->setCheckSquare(checkedKingSquare());
+
+    if (animate) {
+        m_board->animateMove(from, to, snapshot);
+    }
+    else {
+        m_board->setPosition(snapshot);
+    }
+}
+
+void MainWindow::updateGameStatusViews()
+{
+    m_activeClockWhite = m_engine.isWhiteTurn();
+    m_sidebar->setActivePlayer(m_activeClockWhite);
+    const std::array<Piece, 64> board = boardSnapshot();
+    const double eval = materialScore(board);
+    m_sidebar->setEvaluation(eval);
+    m_sidebar->setMaterialSummary(materialForWhite(true), materialForWhite(false));
+    m_sidebar->setAnalysisDetails(m_lastTo >= 0 ? squareName(m_lastFrom) + squareName(m_lastTo) : QString(),
+                                  eval,
+                                  m_lastSearchDepth,
+                                  difficultyText(m_appSettings.game.engineDifficulty));
     updateGameStatusLabel();
-}
-
-void MainWindow::truncateHistory()
-{
-    if (currentMoveIndex + 1 >= static_cast<int>(positionHistory.size())) {
-        return;
-    }
-
-    positionHistory.resize(currentMoveIndex + 1);
-    repetitionHistory.resize(currentMoveIndex + 1);
-    moveHistory.resize(currentMoveIndex);
-
-    while (moveHistoryList->count() > (currentMoveIndex + 1) / 2) {
-        delete moveHistoryList->takeItem(moveHistoryList->count() - 1);
-    }
-}
-
-void MainWindow::addMoveToHistory(bool whiteMove, const QString& san)
-{
-    if (whiteMove) {
-        int moveNumber = static_cast<int>(moveHistory.size() / 2) + 1;
-        QString row = QString("%1. %2").arg(moveNumber).arg(san);
-        moveHistoryList->addItem(row);
-        moveHistoryList->setCurrentRow(moveHistoryList->count() - 1);
-        return;
-    }
-
-    int rowIndex = moveHistoryList->count() - 1;
-    if (rowIndex >= 0) {
-        QString existing = moveHistoryList->item(rowIndex)->text();
-        existing += " " + san;
-        moveHistoryList->item(rowIndex)->setText(existing);
-        moveHistoryList->setCurrentRow(rowIndex);
-    }
-}
-
-void MainWindow::highlightLastMove()
-{
-    resetColors();
-
-    if (lastFrom == -1 || lastTo == -1) {
-        return;
-    }
-
-    auto highlightColor = [](int r, int c) {
-        bool isLight = ((r + c) % 2 == 0);
-        return isLight ? "#f7f683" : "#baca44";
-    };
-
-    int fr = lastFrom / 8;
-    int fc = lastFrom % 8;
-    boardButtons[fr][fc]->setStyleSheet(
-        "background-color: " + QString(highlightColor(fr, fc)) + "; border: none;");
-
-    int tr = lastTo / 8;
-    int tc = lastTo % 8;
-    boardButtons[tr][tc]->setStyleSheet(
-        "background-color: " + QString(highlightColor(tr, tc)) + "; border: none;");
+    updateModeStatus();
 }
 
 bool MainWindow::checkDrawByRepetitionOr50()
 {
-    uint64_t currentHash = engine.positionHash();
-
+    const uint64_t currentHash = m_engine.positionHash();
     int count = 0;
-    for (uint64_t hash : repetitionHistory) {
+    for (uint64_t hash : m_repetitionHistory) {
         if (hash == currentHash) {
             ++count;
         }
     }
 
     if (count >= 3) {
-        turnLabel->setText("Draw by Threefold Repetition");
+        m_gameFinished = true;
+        m_centerStatus->setText("Draw by threefold repetition");
+        m_sidebar->setStatusText("Draw by threefold repetition");
+        updateBoardInputState();
         return true;
     }
 
-    if (engine.gameStatus().kind == chess::GameStatusKind::FiftyMoveRule) {
-        turnLabel->setText("Draw by 50-move Rule");
+    if (m_engine.gameStatus().kind == chess::GameStatusKind::FiftyMoveRule) {
+        m_gameFinished = true;
+        m_centerStatus->setText("Draw by 50-move rule");
+        m_sidebar->setStatusText("Draw by 50-move rule");
+        updateBoardInputState();
         return true;
     }
 
@@ -598,21 +1361,217 @@ bool MainWindow::checkDrawByRepetitionOr50()
 
 bool MainWindow::updateGameStatusLabel()
 {
-    chess::GameStatus status = engine.gameStatus();
+    const chess::GameStatus status = m_engine.gameStatus();
+    QString text;
 
     switch (status.kind) {
     case chess::GameStatusKind::Checkmate:
-        turnLabel->setText(status.whiteToMove ? "White is checkmated" : "Black is checkmated");
-        return true;
+        m_gameFinished = true;
+        text = status.whiteToMove ? "Checkmate - Black wins" : "Checkmate - White wins";
+        break;
     case chess::GameStatusKind::Stalemate:
-        turnLabel->setText("Draw by stalemate");
-        return true;
+        m_gameFinished = true;
+        text = "Draw by stalemate";
+        break;
     case chess::GameStatusKind::FiftyMoveRule:
-        turnLabel->setText("Draw by 50-move Rule");
-        return true;
+        m_gameFinished = true;
+        text = "Draw by 50-move rule";
+        break;
     case chess::GameStatusKind::Ongoing:
     default:
-        turnLabel->setText(engine.isWhiteTurn() ? "White's Turn" : "Black's Turn");
-        return false;
+        text = m_engine.isWhiteTurn() ? "White to move" : "Black to move";
+        if (status.inCheck) {
+            text += " - check";
+        }
+        break;
     }
+
+    m_centerStatus->setText(text);
+    m_sidebar->setStatusText(text);
+    m_board->setCheckSquare(checkedKingSquare());
+    statusBar()->showMessage(modeStatusText() + " | " + text);
+    updateBoardInputState();
+    return status.kind != chess::GameStatusKind::Ongoing;
+}
+
+void MainWindow::updateModeStatus()
+{
+    if (m_appSettings.game.gameMode == GameMode::HumanVsHuman) {
+        m_sidebar->setModeText("Human vs Human");
+        m_sidebar->setPlayerInfo("Local Player", "White", "Local Player", "Black");
+        return;
+    }
+
+    const QString humanSide = playerSideText(m_resolvedHumanSide);
+    m_sidebar->setModeText(QString("Human vs Engine - %1").arg(difficultyText(m_appSettings.game.engineDifficulty)));
+    if (m_resolvedHumanSide == PlayerSide::White) {
+        m_sidebar->setPlayerInfo("You", "White", "Engine", "Black");
+    }
+    else {
+        m_sidebar->setPlayerInfo("Engine", "White", "You", "Black");
+    }
+    statusBar()->showMessage(QString("Human vs Engine - %1 - You are %2")
+                             .arg(difficultyText(m_appSettings.game.engineDifficulty), humanSide));
+}
+
+QString MainWindow::modeStatusText() const
+{
+    if (m_appSettings.game.gameMode == GameMode::HumanVsHuman) {
+        return "Human vs Human";
+    }
+    return QString("Human vs Engine - %1 - You are %2")
+        .arg(difficultyText(m_appSettings.game.engineDifficulty),
+             playerSideText(m_resolvedHumanSide));
+}
+
+QString MainWindow::moveText(const Move& move) const
+{
+    QString text = squareName(move.from) + squareName(move.to);
+    if (move.wasPromotion) {
+        text += "q";
+    }
+    return text;
+}
+
+int MainWindow::checkedKingSquare() const
+{
+    const chess::GameStatus status = m_engine.gameStatus();
+    if (!status.inCheck || status.kind != chess::GameStatusKind::Ongoing) {
+        return -1;
+    }
+
+    for (int square = 0; square < 64; ++square) {
+        if (isKing(m_engine.pieceAt(square), m_engine.isWhiteTurn())) {
+            return square;
+        }
+    }
+    return -1;
+}
+
+int MainWindow::materialForWhite(bool white) const
+{
+    int material = 0;
+    const auto board = boardSnapshot();
+    for (Piece piece : board) {
+        if (piece != EMPTY && isWhitePiece(piece) == white) {
+            material += pieceValue(piece);
+        }
+    }
+    return material;
+}
+
+void MainWindow::playMoveFeedback(const Move& move)
+{
+    if (!m_appSettings.ui.soundsEnabled) {
+        return;
+    }
+
+    const chess::GameStatus status = m_engine.gameStatus();
+    if (status.inCheck) {
+        m_checkSound.play();
+    }
+    else if (move.captured != EMPTY || move.wasEnPassant) {
+        m_captureSound.play();
+    }
+    else {
+        m_moveSound.play();
+    }
+}
+
+void MainWindow::updateClocks()
+{
+    if (!m_clockElapsed.isValid()) {
+        m_clockElapsed.start();
+        return;
+    }
+
+    const qint64 elapsed = m_clockElapsed.restart();
+    if (!m_gameFinished && !m_unlimitedTime) {
+        if (m_activeClockWhite) {
+            m_whiteRemainingMs = std::max<qint64>(0, m_whiteRemainingMs - elapsed);
+            if (m_whiteRemainingMs == 0) {
+                m_gameFinished = true;
+                m_centerStatus->setText("White lost on time");
+                m_sidebar->setStatusText("White lost on time");
+            }
+        }
+        else {
+            m_blackRemainingMs = std::max<qint64>(0, m_blackRemainingMs - elapsed);
+            if (m_blackRemainingMs == 0) {
+                m_gameFinished = true;
+                m_centerStatus->setText("Black lost on time");
+                m_sidebar->setStatusText("Black lost on time");
+            }
+        }
+    }
+
+    m_sidebar->setClockTimes(m_whiteRemainingMs, m_blackRemainingMs);
+    updateBoardInputState();
+    updateActionStates();
+}
+
+void MainWindow::resetClocks()
+{
+    m_unlimitedTime = m_appSettings.game.initialTimeMs < 0;
+    m_whiteRemainingMs = m_appSettings.game.initialTimeMs;
+    m_blackRemainingMs = m_appSettings.game.initialTimeMs;
+    if (m_unlimitedTime) {
+        m_whiteRemainingMs = -1;
+        m_blackRemainingMs = -1;
+    }
+    m_activeClockWhite = true;
+    m_clockElapsed.restart();
+    m_sidebar->setClockTimes(m_whiteRemainingMs, m_blackRemainingMs);
+    m_sidebar->setActivePlayer(true);
+}
+
+void MainWindow::recordCurrentPosition()
+{
+    m_positionHistory.push_back(m_engine.currentFen());
+    m_repetitionHistory.push_back(m_engine.positionHash());
+}
+
+void MainWindow::restorePosition(int positionIndex)
+{
+    if (positionIndex < 0 || positionIndex >= static_cast<int>(m_positionHistory.size())) {
+        return;
+    }
+
+    m_currentMoveIndex = positionIndex;
+    m_engine.setPositionFromFen(m_positionHistory[m_currentMoveIndex]);
+    clearSelection();
+    m_gameFinished = false;
+
+    if (m_currentMoveIndex > 0 && m_currentMoveIndex - 1 < static_cast<int>(m_moveHistory.size())) {
+        m_lastFrom = m_moveHistory[m_currentMoveIndex - 1].from;
+        m_lastTo = m_moveHistory[m_currentMoveIndex - 1].to;
+        refreshBoard(false, m_lastFrom, m_lastTo);
+    }
+    else {
+        m_lastFrom = -1;
+        m_lastTo = -1;
+        refreshBoard(false);
+    }
+
+    m_sidebar->setCurrentPly(m_currentMoveIndex);
+    updateGameStatusViews();
+    updateActionStates();
+    updateBoardInputState();
+}
+
+void MainWindow::truncateHistory()
+{
+    if (m_currentMoveIndex + 1 >= static_cast<int>(m_positionHistory.size())) {
+        return;
+    }
+
+    m_positionHistory.resize(m_currentMoveIndex + 1);
+    m_repetitionHistory.resize(m_currentMoveIndex + 1);
+    m_moveHistory.resize(m_currentMoveIndex);
+    m_sidebar->truncateMovesToPly(m_currentMoveIndex);
+}
+
+void MainWindow::addMoveToHistory(bool whiteMove, const QString& san)
+{
+    m_sidebar->addMove(whiteMove, san);
 }
