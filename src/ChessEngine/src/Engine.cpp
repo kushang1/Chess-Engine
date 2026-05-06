@@ -1038,6 +1038,48 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	Move bestSafeMove = rootMoves[0];
 	int bestSafeScore = -INF;
 	bool haveSafe = false;
+	std::vector<int> rootMoveScores(rootMoves.size(), -INF);
+	std::vector<char> rootMoveHasScore(rootMoves.size(), 0);
+
+	auto sortRootMovesByPreviousScores = [&]() {
+		if (rootMoves.size() < 2) {
+			return;
+		}
+
+		std::vector<size_t> order(rootMoves.size());
+		for (size_t i = 0; i < order.size(); ++i) {
+			order[i] = i;
+		}
+
+		std::stable_sort(order.begin(), order.end(),
+			[&](size_t lhs, size_t rhs) {
+				if (rootMoveHasScore[lhs] != rootMoveHasScore[rhs]) {
+					return rootMoveHasScore[lhs] > rootMoveHasScore[rhs];
+				}
+				if (rootMoveHasScore[lhs] &&
+					rootMoveScores[lhs] != rootMoveScores[rhs]) {
+					return rootMoveScores[lhs] > rootMoveScores[rhs];
+				}
+				return false;
+			});
+
+		std::vector<Move> orderedMoves;
+		std::vector<int> orderedScores;
+		std::vector<char> orderedHasScore;
+		orderedMoves.reserve(rootMoves.size());
+		orderedScores.reserve(rootMoveScores.size());
+		orderedHasScore.reserve(rootMoveHasScore.size());
+
+		for (size_t index : order) {
+			orderedMoves.push_back(rootMoves[index]);
+			orderedScores.push_back(rootMoveScores[index]);
+			orderedHasScore.push_back(rootMoveHasScore[index]);
+		}
+
+		rootMoves = std::move(orderedMoves);
+		rootMoveScores = std::move(orderedScores);
+		rootMoveHasScore = std::move(orderedHasScore);
+		};
 
 	struct RootSearchResult {
 		Move move;
@@ -1063,6 +1105,19 @@ Move Engine::findBestMove(board& b, int maxDepth,
 			bestSafeMove = result.bestMove;
 			bestSafeScore = result.bestScore;
 			haveSafe = true;
+		}
+		};
+
+	auto rememberRootScores = [&](const RootIterationResult& result) {
+		if (result.results.size() != rootMoveScores.size()) {
+			return;
+		}
+
+		for (size_t i = 0; i < result.results.size(); ++i) {
+			if (result.results[i].fullySearched) {
+				rootMoveScores[i] = result.results[i].score;
+				rootMoveHasScore[i] = 1;
+			}
 		}
 		};
 
@@ -1174,17 +1229,8 @@ Move Engine::findBestMove(board& b, int maxDepth,
 			break;
 		}
 
-		// Move ordering: try previous best first
-		if (haveFull)
-		{
-			auto it = std::find_if(rootMoves.begin(), rootMoves.end(),
-				[&](const Move& m) {
-					return m.from == bestFullMove.from &&
-						m.to == bestFullMove.to &&
-						m.moved == bestFullMove.moved;
-				});
-			if (it != rootMoves.end())
-				std::swap(rootMoves[0], *it);
+		if (haveFull) {
+			sortRootMovesByPreviousScores();
 		}
 
 		constexpr int InitialAspirationWindow = 50;
@@ -1243,6 +1289,7 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 		if (!timedOut && depthCompleted)
 		{
+			rememberRootScores(lastAttempt);
 			bestFullMove = lastAttempt.bestMove;
 			bestFullScore = lastAttempt.bestScore;
 			haveFull = true;
@@ -1728,6 +1775,7 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 {
 	totalNodes++;  // still count these as nodes
 	constexpr int MaxQSearchPly = 24;
+	constexpr int MaxQuietCheckQply = 4;
 	constexpr int DeltaMargin = 150;
 
 	if (shouldStop()) {
@@ -1751,7 +1799,7 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 		moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
 
 	MoveList moves;
-	moveGenerator->generateLegalMoves(b, moves);
+	moveGenerator->generateQuiescenceMoves(b, moves);
 
 	if (inCheck && moves.count == 0) {
 		return -MATE_SCORE + ply;
@@ -1788,6 +1836,15 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 		for (auto& m : moves) {
 			bool tactical = (m.captured != EMPTY) || m.wasEnPassant || m.wasPromotion;
 			if (!tactical) {
+				if (qply >= MaxQuietCheckQply) {
+					continue;
+				}
+
+				qMoves[searchCount] = m;
+				scores[searchCount] = 250000 +
+					std::clamp(scoreMove(m, b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move()),
+						-50000, 50000);
+				++searchCount;
 				continue;
 			}
 

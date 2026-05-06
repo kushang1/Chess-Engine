@@ -26,6 +26,8 @@ private:
         long long nodeLimit = 0;
         int mateMoves = 0;
         std::vector<std::string> searchMoves;
+        bool depthSet = false;
+        bool moveTimeSet = false;
         bool infinite = false;
         bool perft = false;
         int perftDepth = 0;

@@ -268,9 +268,11 @@ UciLoop::GoCommand UciLoop::parseGo(const std::vector<std::string>& tokens) cons
         const std::string& token = tokens[i];
         if (token == "depth" && i + 1 < static_cast<int>(tokens.size())) {
             command.depth = std::max(1, parseInt(tokens[++i], command.depth));
+            command.depthSet = true;
         }
         else if (token == "movetime" && i + 1 < static_cast<int>(tokens.size())) {
             command.moveTimeMs = std::max(1, parseInt(tokens[++i], DefaultMoveTimeMs));
+            command.moveTimeSet = true;
         }
         else if (token == "wtime" && i + 1 < static_cast<int>(tokens.size())) {
             command.whiteTimeMs = parseInt(tokens[++i], -1);
@@ -348,7 +350,7 @@ chess::SearchLimits UciLoop::makeSearchLimits(const GoCommand& command) const
         return limits;
     }
 
-    if (command.moveTimeMs > 0) {
+    if (command.moveTimeSet) {
         limits.moveTimeMs = std::max(1, command.moveTimeMs - moveOverheadMs);
         return limits;
     }
@@ -361,6 +363,9 @@ chess::SearchLimits UciLoop::makeSearchLimits(const GoCommand& command) const
         int withIncrement = base + increment / 2;
         int capped = std::min(withIncrement, std::max(1, available / 3));
         limits.moveTimeMs = std::max(10, capped - moveOverheadMs);
+    }
+    else if (command.depthSet || command.nodeLimit > 0 || command.mateMoves > 0) {
+        limits.moveTimeMs = InfiniteMoveTimeMs;
     }
     else {
         limits.moveTimeMs = DefaultMoveTimeMs;

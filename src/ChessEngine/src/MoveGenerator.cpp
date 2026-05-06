@@ -19,6 +19,8 @@ struct GenerationContext {
     std::array<Bitboard, 64> pinMasks{};
 };
 
+void generateMoves(board& b, MoveList& moves, bool legalOnly);
+
 inline bool isKingPiece(Piece p) {
     return p == WK || p == BK;
 }
@@ -408,6 +410,213 @@ void generateCastles(const board& b, MoveList& moves, const GenerationContext& c
     }
 }
 
+bool quietMoveGivesCheck(const board& b, const GenerationContext& ctx, Piece moved, int from, int to) {
+    int enemyKingSq = b.kingSquare(!ctx.whiteToMove);
+    if (enemyKingSq == -1) {
+        return false;
+    }
+
+    Bitboard enemyKing = Bitboards::bit(enemyKingSq);
+    Bitboard fromMask = Bitboards::bit(from);
+    Bitboard toMask = Bitboards::bit(to);
+    Bitboard occAfter = (ctx.occ ^ fromMask) | toMask;
+
+    switch (moved) {
+    case WP:
+    case BP:
+        if ((Bitboards::PawnAttacks[ctx.whiteToMove ? Bitboards::WHITE : Bitboards::BLACK][to] &
+            enemyKing) != 0) {
+            return true;
+        }
+        break;
+    case WN:
+    case BN:
+        if ((Bitboards::KnightAttacks[to] & enemyKing) != 0) {
+            return true;
+        }
+        break;
+    case WB:
+    case BB:
+        if ((Bitboards::bishopAttacks(to, occAfter) & enemyKing) != 0) {
+            return true;
+        }
+        break;
+    case WR:
+    case BR:
+        if ((Bitboards::rookAttacks(to, occAfter) & enemyKing) != 0) {
+            return true;
+        }
+        break;
+    case WQ:
+    case BQ:
+        if ((Bitboards::queenAttacks(to, occAfter) & enemyKing) != 0) {
+            return true;
+        }
+        break;
+    case WK:
+    case BK:
+        if ((Bitboards::KingAttacks[to] & enemyKing) != 0) {
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+
+    Bitboard discoveredBishops = bishopQueens(b, ctx.whiteToMove) & ~fromMask;
+    if ((Bitboards::bishopAttacks(enemyKingSq, occAfter) & discoveredBishops) != 0) {
+        return true;
+    }
+
+    Bitboard discoveredRooks = rookQueens(b, ctx.whiteToMove) & ~fromMask;
+    return (Bitboards::rookAttacks(enemyKingSq, occAfter) & discoveredRooks) != 0;
+}
+
+void generateQuiescencePawnMoves(board& b, MoveList& moves, const GenerationContext& ctx) {
+    Piece pawn = pawnPiece(ctx.whiteToMove);
+    Bitboard pawns = b.pieces(pawn);
+
+    while (pawns) {
+        int from = Bitboards::poplsb(pawns);
+        Bitboard fromMask = Bitboards::bit(from);
+        Bitboard pinMask = ((ctx.pinned & fromMask) != 0) ? ctx.pinMasks[from] : FULL_MASK;
+        int row = from >> 3;
+
+        int oneStep = ctx.whiteToMove ? (from - 8) : (from + 8);
+        if (oneStep >= 0 && oneStep < 64) {
+            Bitboard oneMask = Bitboards::bit(oneStep);
+            if ((ctx.occ & oneMask) == 0 && (pinMask & oneMask) != 0) {
+                bool promotion = ctx.whiteToMove ? (row == 1) : (row == 6);
+                if (promotion) {
+                    addPromotionMoves(moves, b, from, oneStep, pawn, EMPTY);
+                }
+                else if (quietMoveGivesCheck(b, ctx, pawn, from, oneStep)) {
+                    addQuietOrCapture(moves, b, from, oneStep, pawn, EMPTY);
+                }
+
+                bool startRank = ctx.whiteToMove ? (row == 6) : (row == 1);
+                if (!promotion && startRank) {
+                    int twoStep = ctx.whiteToMove ? (from - 16) : (from + 16);
+                    Bitboard twoMask = Bitboards::bit(twoStep);
+                    if ((ctx.occ & twoMask) == 0 &&
+                        (pinMask & twoMask) != 0 &&
+                        quietMoveGivesCheck(b, ctx, pawn, from, twoStep)) {
+                        addQuietOrCapture(moves, b, from, twoStep, pawn, EMPTY);
+                        moves.back().hasEnPassant = true;
+                        moves.back().enPassantSquare = oneStep;
+                    }
+                }
+            }
+        }
+
+        Bitboard captures = Bitboards::PawnAttacks[ctx.whiteToMove ? Bitboards::WHITE : Bitboards::BLACK][from]
+            & ctx.themOcc
+            & pinMask;
+
+        while (captures) {
+            int to = Bitboards::poplsb(captures);
+            Piece captured = b.pieceAt(to);
+            bool promotion = ctx.whiteToMove ? (row == 1) : (row == 6);
+            if (promotion) {
+                addPromotionMoves(moves, b, from, to, pawn, captured);
+            }
+            else {
+                addQuietOrCapture(moves, b, from, to, pawn, captured);
+            }
+        }
+
+        maybeAddEnPassant(b, moves, ctx, from, true);
+    }
+}
+
+void generateQuiescenceKnightMoves(const board& b, MoveList& moves, const GenerationContext& ctx) {
+    Piece knight = knightPiece(ctx.whiteToMove);
+    Bitboard knights = b.pieces(knight) & ~ctx.pinned;
+
+    while (knights) {
+        int from = Bitboards::poplsb(knights);
+        Bitboard targets = Bitboards::KnightAttacks[from] & ~ctx.usOcc;
+        Bitboard captures = targets & ctx.themOcc;
+        while (captures) {
+            int to = Bitboards::poplsb(captures);
+            addQuietOrCapture(moves, b, from, to, knight, b.pieceAt(to));
+        }
+
+        Bitboard quiets = targets & ~ctx.occ;
+        while (quiets) {
+            int to = Bitboards::poplsb(quiets);
+            if (quietMoveGivesCheck(b, ctx, knight, from, to)) {
+                addQuietOrCapture(moves, b, from, to, knight, EMPTY);
+            }
+        }
+    }
+}
+
+template <Bitboard(*AttackFn)(int, Bitboard)>
+void generateQuiescenceSlidingMoves(const board& b, MoveList& moves, const GenerationContext& ctx, Piece piece) {
+    Bitboard pieces = b.pieces(piece);
+
+    while (pieces) {
+        int from = Bitboards::poplsb(pieces);
+        Bitboard fromMask = Bitboards::bit(from);
+        Bitboard targets = AttackFn(from, ctx.occ) & ~ctx.usOcc;
+        if ((ctx.pinned & fromMask) != 0) {
+            targets &= ctx.pinMasks[from];
+        }
+
+        Bitboard captures = targets & ctx.themOcc;
+        while (captures) {
+            int to = Bitboards::poplsb(captures);
+            addQuietOrCapture(moves, b, from, to, piece, b.pieceAt(to));
+        }
+
+        Bitboard quiets = targets & ~ctx.occ;
+        while (quiets) {
+            int to = Bitboards::poplsb(quiets);
+            if (quietMoveGivesCheck(b, ctx, piece, from, to)) {
+                addQuietOrCapture(moves, b, from, to, piece, EMPTY);
+            }
+        }
+    }
+}
+
+void generateQuiescenceKingMoves(const board& b, MoveList& moves, const GenerationContext& ctx) {
+    Bitboard targets = Bitboards::KingAttacks[ctx.kingSq] & ~ctx.usOcc;
+
+    while (targets) {
+        int to = Bitboards::poplsb(targets);
+        if (!kingMoveLeavesSafe(b, ctx, to)) {
+            continue;
+        }
+
+        Piece captured = ((ctx.themOcc & Bitboards::bit(to)) != 0) ? b.pieceAt(to) : EMPTY;
+        if (captured != EMPTY || quietMoveGivesCheck(b, ctx, kingPiece(ctx.whiteToMove), ctx.kingSq, to)) {
+            addQuietOrCapture(moves, b, ctx.kingSq, to, kingPiece(ctx.whiteToMove), captured);
+        }
+    }
+}
+
+void generateQuiescenceMoveList(board& b, MoveList& moves) {
+    moves.clear();
+
+    GenerationContext ctx = buildContext(b, true);
+    if (ctx.kingSq == -1) {
+        return;
+    }
+
+    if (ctx.checkerCount != 0) {
+        generateMoves(b, moves, true);
+        return;
+    }
+
+    generateQuiescenceKingMoves(b, moves, ctx);
+    generateQuiescencePawnMoves(b, moves, ctx);
+    generateQuiescenceKnightMoves(b, moves, ctx);
+    generateQuiescenceSlidingMoves<Bitboards::bishopAttacks>(b, moves, ctx, bishopPiece(ctx.whiteToMove));
+    generateQuiescenceSlidingMoves<Bitboards::rookAttacks>(b, moves, ctx, rookPiece(ctx.whiteToMove));
+    generateQuiescenceSlidingMoves<Bitboards::queenAttacks>(b, moves, ctx, queenPiece(ctx.whiteToMove));
+}
+
 int countEnPassant(board& b, const GenerationContext& ctx, int from, bool legalOnly) {
     if (!b.hasEnPassant || b.enPassantSquare < 0) {
         return 0;
@@ -671,6 +880,10 @@ void MoveGenerator::generatePseudoLegalMoves(board& Board, MoveList& moves) {
 
 void MoveGenerator::generateLegalMoves(board& Board, MoveList& moves) {
     generateMoves(Board, moves, true);
+}
+
+void MoveGenerator::generateQuiescenceMoves(board& Board, MoveList& moves) {
+    generateQuiescenceMoveList(Board, moves);
 }
 
 int MoveGenerator::countLegalMoves(board& Board) {

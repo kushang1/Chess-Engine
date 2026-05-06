@@ -76,6 +76,7 @@ public:
     std::vector<Move> generateLegalMoves(board& Board);
     void generatePseudoLegalMoves(board& Board, MoveList& moves);
     void generateLegalMoves(board& Board, MoveList& moves);
+    void generateQuiescenceMoves(board& Board, MoveList& moves);
     int countLegalMoves(board& Board);
 
     bool isSquareAttacked(const board& Board, int sq, bool byWhite);
