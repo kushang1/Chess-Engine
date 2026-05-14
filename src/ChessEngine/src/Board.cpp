@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 
+#include "Profiler.h"
 #include "ZobristHashing.h"
 
 namespace {
@@ -280,6 +281,9 @@ void board::rebuildPieceLists() {
 }
 
 Unmove board::makeMove(const Move& m) {
+    PROFILE_INC(::Profiler::MakeMoveCalls);
+    PROFILE_TIMER(::Profiler::MakeMoveTime);
+
     Unmove u;
     u.fromPiece = m.moved;
     u.toPiece = m.wasEnPassant ? EMPTY : m.captured;
@@ -374,6 +378,9 @@ Unmove board::makeMove(const Move& m) {
 }
 
 void board::unmakeMove(const Move& m, const Unmove& u) {
+    PROFILE_INC(::Profiler::UnmakeMoveCalls);
+    PROFILE_TIMER(::Profiler::UnmakeMoveTime);
+
     Piece moving = u.fromPiece;
 
     isWhiteTurn = u.prevTurn;

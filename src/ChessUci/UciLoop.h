@@ -39,6 +39,8 @@ private:
     void handlePosition(const std::vector<std::string>& tokens);
     void handleGo(const std::vector<std::string>& tokens);
     void handlePerft(int depth);
+    void handleProfile(const std::vector<std::string>& tokens);
+    void handleBenchProfile();
 
     GoCommand parseGo(const std::vector<std::string>& tokens) const;
     chess::SearchLimits makeSearchLimits(const GoCommand& command) const;

@@ -13,6 +13,8 @@ syzygy/
 *.tlog
 *.iobj
 *.ipdb
+*.err
+*.out
 
 
 

@@ -7,6 +7,7 @@
 #include "Board.h"
 #include "Engine.h"
 #include "MoveGenerator.h"
+#include "Profiler.h"
 
 namespace {
 
@@ -308,10 +309,16 @@ void ChessEngine::stopSearch()
 
 PerftResult ChessEngine::perft(int depth)
 {
+    PROFILE_INC(::Profiler::PerftCalls);
+    PROFILE_MAX(::Profiler::PerftDepth, depth);
+    PROFILE_TIMER(::Profiler::PerftTime);
+    PROFILE_MOVEGEN_CONTEXT(Perft);
+
     PerftResult result;
     board copy = impl->position;
     auto start = std::chrono::steady_clock::now();
     result.nodes = perftImpl(copy, impl->moveGenerator, depth);
+    PROFILE_ADD(::Profiler::PerftNodes, result.nodes);
     auto end = std::chrono::steady_clock::now();
     result.elapsedMs = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
@@ -320,6 +327,11 @@ PerftResult ChessEngine::perft(int depth)
 
 std::vector<PerftDivideEntry> ChessEngine::divide(int depth)
 {
+    PROFILE_INC(::Profiler::PerftDivideCalls);
+    PROFILE_MAX(::Profiler::PerftDepth, depth);
+    PROFILE_TIMER(::Profiler::PerftTime);
+    PROFILE_MOVEGEN_CONTEXT(Perft);
+
     std::vector<PerftDivideEntry> entries;
     if (depth <= 0) {
         return entries;
@@ -330,13 +342,16 @@ std::vector<PerftDivideEntry> ChessEngine::divide(int depth)
     impl->moveGenerator.generateLegalMoves(copy, moves);
     entries.reserve(moves.count);
 
+    long long nodes = 0;
     for (Move& move : moves) {
         Unmove undo = copy.makeMove(move);
         long long childNodes = perftImpl(copy, impl->moveGenerator, depth - 1);
         copy.unmakeMove(move, undo);
+        nodes += childNodes;
         entries.push_back(PerftDivideEntry{ move, childNodes });
     }
 
+    PROFILE_ADD(::Profiler::PerftNodes, nodes);
     return entries;
 }
 

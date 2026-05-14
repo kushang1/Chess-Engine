@@ -1373,6 +1373,10 @@ bool MainWindow::updateGameStatusLabel()
         m_gameFinished = true;
         text = "Draw by stalemate";
         break;
+    case chess::GameStatusKind::ThreefoldRepetition:
+        m_gameFinished = true;
+        text = "Draw by threefold repetition";
+        break;
     case chess::GameStatusKind::FiftyMoveRule:
         m_gameFinished = true;
         text = "Draw by 50-move rule";

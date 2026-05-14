@@ -2,6 +2,7 @@
 
 
 #include "Engine.h"
+#include "Profiler.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -496,41 +497,322 @@ static int promotionGainCp(const Move& m)
 	return m.wasPromotion ? pieceValueCp(m.promotedTo) - pieceValueCp(m.moved) : 0;
 }
 
+static bool isWhitePieceFast(Piece p)
+{
+	return p >= WQ && p <= WB;
+}
+
+static Piece pawnPieceFor(bool white)
+{
+	return white ? WP : BP;
+}
+
+static Piece knightPieceFor(bool white)
+{
+	return white ? WN : BN;
+}
+
+static Piece bishopPieceFor(bool white)
+{
+	return white ? WB : BB;
+}
+
+static Piece rookPieceFor(bool white)
+{
+	return white ? WR : BR;
+}
+
+static Piece queenPieceFor(bool white)
+{
+	return white ? WQ : BQ;
+}
+
+static Piece kingPieceFor(bool white)
+{
+	return white ? WK : BK;
+}
+
+static Piece capturedPieceForMove(const Move& m)
+{
+	if (m.wasEnPassant && m.captured == EMPTY) {
+		return isWhitePieceFast(m.moved) ? BP : WP;
+	}
+	return m.captured;
+}
+
 static bool isQuietMove(const Move& m)
 {
 	return m.captured == EMPTY && !m.wasEnPassant && !m.wasPromotion;
 }
 
+#ifdef ENABLE_ENGINE_PROFILING
+static void profileApproximateSeeCallSite()
+{
+	switch (Profiler::currentSeeContext()) {
+	case Profiler::SeeContext::MoveOrdering:
+		PROFILE_INC(::Profiler::ApproximateSeeForMoveOrdering);
+		break;
+	case Profiler::SeeContext::MainSearchPruning:
+		PROFILE_INC(::Profiler::ApproximateSeeForMainSearchPruning);
+		break;
+	case Profiler::SeeContext::QsearchPruning:
+		PROFILE_INC(::Profiler::ApproximateSeeForQsearchPruning);
+		break;
+	case Profiler::SeeContext::QsearchMoveOrdering:
+		PROFILE_INC(::Profiler::ApproximateSeeForQsearchMoveOrdering);
+		break;
+	case Profiler::SeeContext::PromotionHandling:
+		PROFILE_INC(::Profiler::ApproximateSeeForPromotionHandling);
+		break;
+	case Profiler::SeeContext::Other:
+	default:
+		PROFILE_INC(::Profiler::ApproximateSeeOther);
+		break;
+	}
+}
+
+static void profileApproximateSeeMoveType(const Move& move)
+{
+	if (move.captured != EMPTY || move.wasEnPassant) {
+		PROFILE_INC(::Profiler::ApproximateSeeOnCapture);
+	}
+	if (move.wasPromotion) {
+		PROFILE_INC(::Profiler::ApproximateSeeOnPromotion);
+	}
+	if (move.captured == EMPTY && !move.wasEnPassant && !move.wasPromotion) {
+		PROFILE_INC(::Profiler::ApproximateSeeOnQuiet);
+	}
+}
+
+static void profileApproximateSeeResult(int gain)
+{
+	if (gain > 0) {
+		PROFILE_INC(::Profiler::ApproximateSeePositive);
+	}
+	else if (gain < 0) {
+		PROFILE_INC(::Profiler::ApproximateSeeNegative);
+	}
+	else {
+		PROFILE_INC(::Profiler::ApproximateSeeEqual);
+	}
+}
+#endif // ENABLE_ENGINE_PROFILING
+
+static Bitboard attackersToSquare(const Bitboard pieces[13], int sq, bool byWhite, Bitboard occ)
+{
+	if (sq < 0 || sq >= 64) {
+		return 0;
+	}
+
+	Bitboard attackers = 0;
+	attackers |= Bitboards::PawnAttackers[byWhite ? Bitboards::WHITE : Bitboards::BLACK][sq]
+		& pieces[pawnPieceFor(byWhite)];
+	attackers |= Bitboards::KnightAttacks[sq] & pieces[knightPieceFor(byWhite)];
+	attackers |= Bitboards::KingAttacks[sq] & pieces[kingPieceFor(byWhite)];
+	attackers |= Bitboards::bishopAttacks(sq, occ) &
+		(pieces[bishopPieceFor(byWhite)] | pieces[queenPieceFor(byWhite)]);
+	attackers |= Bitboards::rookAttacks(sq, occ) &
+		(pieces[rookPieceFor(byWhite)] | pieces[queenPieceFor(byWhite)]);
+	return attackers;
+}
+
+static Bitboard attackMapForSide(const board& b, bool byWhite)
+{
+	Bitboard attacks = 0;
+	const Bitboard occ = b.occupied;
+	const int color = byWhite ? Bitboards::WHITE : Bitboards::BLACK;
+
+	Bitboard pieces = b.pieces(pawnPieceFor(byWhite));
+	while (pieces != 0) {
+		int from = Bitboards::poplsb(pieces);
+		attacks |= Bitboards::PawnAttacks[color][from];
+	}
+
+	pieces = b.pieces(knightPieceFor(byWhite));
+	while (pieces != 0) {
+		int from = Bitboards::poplsb(pieces);
+		attacks |= Bitboards::KnightAttacks[from];
+	}
+
+	pieces = b.pieces(bishopPieceFor(byWhite));
+	while (pieces != 0) {
+		int from = Bitboards::poplsb(pieces);
+		attacks |= Bitboards::bishopAttacks(from, occ);
+	}
+
+	pieces = b.pieces(rookPieceFor(byWhite));
+	while (pieces != 0) {
+		int from = Bitboards::poplsb(pieces);
+		attacks |= Bitboards::rookAttacks(from, occ);
+	}
+
+	pieces = b.pieces(queenPieceFor(byWhite));
+	while (pieces != 0) {
+		int from = Bitboards::poplsb(pieces);
+		attacks |= Bitboards::queenAttacks(from, occ);
+	}
+
+	pieces = b.pieces(kingPieceFor(byWhite));
+	while (pieces != 0) {
+		int from = Bitboards::poplsb(pieces);
+		attacks |= Bitboards::KingAttacks[from];
+	}
+
+	return attacks;
+}
+
+static Bitboard kingSafetyZoneMask(int kingSq)
+{
+	if (kingSq < 0 || kingSq >= 64) {
+		return 0;
+	}
+
+	static const int kingZone[12][2] = {
+		{-1,-1},{-1,0},{-1,1},
+		{0,-1},        {0,1},
+		{1,-1},{1,0},{1,1},
+		{-2,0}, {-1,-2}, {-1,2}, {2,0}
+	};
+
+	Bitboard zone = 0;
+	int r = kingSq >> 3;
+	int c = kingSq & 7;
+	for (const auto& d : kingZone) {
+		int nr = r + d[0];
+		int nc = c + d[1];
+		if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+			zone |= Bitboards::bit((nr << 3) | nc);
+		}
+	}
+	return zone;
+}
+
+static bool recaptureLeavesKingSafe(const Bitboard pieces[13], Bitboard occ,
+	int target, int from, Piece attacker, bool recapturingWhite, Piece capturedOnTarget)
+{
+	Bitboard afterPieces[13];
+	for (int p = 0; p < 13; ++p) {
+		afterPieces[p] = pieces[p];
+	}
+
+	Bitboard fromMask = Bitboards::bit(from);
+	Bitboard targetMask = Bitboards::bit(target);
+	afterPieces[attacker] &= ~fromMask;
+	afterPieces[attacker] |= targetMask;
+	afterPieces[capturedOnTarget] &= ~targetMask;
+
+	Bitboard occAfter = occ & ~fromMask;
+	Piece recapturingKing = kingPieceFor(recapturingWhite);
+	int kingSq = -1;
+	if (attacker == recapturingKing) {
+		kingSq = target;
+	}
+	else if (afterPieces[recapturingKing] != 0) {
+		kingSq = Bitboards::lsb(afterPieces[recapturingKing]);
+	}
+
+	return kingSq != -1 &&
+		attackersToSquare(afterPieces, kingSq, !recapturingWhite, occAfter) == 0;
+}
+
+static bool hasLegalRecaptureTo(const Bitboard pieces[13], Bitboard occ,
+	int target, bool recapturingWhite, Piece capturedOnTarget)
+{
+	const Piece attackersByValue[6] = {
+		pawnPieceFor(recapturingWhite),
+		knightPieceFor(recapturingWhite),
+		bishopPieceFor(recapturingWhite),
+		rookPieceFor(recapturingWhite),
+		queenPieceFor(recapturingWhite),
+		kingPieceFor(recapturingWhite)
+	};
+
+	Bitboard attackers = attackersToSquare(pieces, target, recapturingWhite, occ);
+	for (Piece attacker : attackersByValue) {
+		Bitboard candidates = attackers & pieces[attacker];
+		while (candidates != 0) {
+			int from = Bitboards::poplsb(candidates);
+			PROFILE_INC(::Profiler::ApproximateSeeRecaptureCandidates);
+			if (recaptureLeavesKingSafe(pieces, occ, target, from, attacker,
+				recapturingWhite, capturedOnTarget)) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 static int approximateSee(const board& b, MoveGenerator* generator, const Move& move)
 {
+	(void)generator;
+	PROFILE_INC(::Profiler::ApproximateSeeCalls);
+	PROFILE_TIMER(::Profiler::ApproximateSeeTime);
+#ifdef ENABLE_ENGINE_PROFILING
+	profileApproximateSeeCallSite();
+	profileApproximateSeeMoveType(move);
+#endif
+
 	if (move.captured == EMPTY && !move.wasEnPassant) {
-		return promotionGainCp(move);
+		PROFILE_INC(::Profiler::ApproximateSeeEarlyReturns);
+		int gain = promotionGainCp(move);
+#ifdef ENABLE_ENGINE_PROFILING
+		profileApproximateSeeResult(gain);
+#endif
+		return gain;
 	}
 
-	int gain = pieceValueCp(move.captured) + promotionGainCp(move);
-	board after = b;
-	after.makeMove(move);
+	Piece captured = capturedPieceForMove(move);
+	int gain = pieceValueCp(captured) + promotionGainCp(move);
 
-	MoveList replies;
-	generator->generateLegalMoves(after, replies);
-
-	int leastRecapture = 0;
-	for (const Move& reply : replies) {
-		if (reply.to != move.to) {
-			continue;
-		}
-
-		int value = pieceValueCp(reply.moved);
-		if (leastRecapture == 0 || value < leastRecapture) {
-			leastRecapture = value;
-		}
+	Bitboard pieces[13];
+	for (int p = 0; p < 13; ++p) {
+		pieces[p] = b.pieceBB[p];
 	}
 
-	if (leastRecapture != 0) {
-		gain -= pieceValueCp(move.wasPromotion ? move.promotedTo : move.moved);
+	Bitboard occ = b.occupied;
+	Bitboard fromMask = Bitboards::bit(move.from);
+	Bitboard toMask = Bitboards::bit(move.to);
+	Piece movedAfterCapture = move.wasPromotion ? move.promotedTo : move.moved;
+
+	pieces[move.moved] &= ~fromMask;
+	occ &= ~fromMask;
+
+	if (move.wasEnPassant) {
+		int capturedSq = isWhitePieceFast(move.moved) ? (move.to + 8) : (move.to - 8);
+		Bitboard capturedMask = Bitboards::bit(capturedSq);
+		pieces[captured] &= ~capturedMask;
+		occ &= ~capturedMask;
 	}
+	else if (captured != EMPTY) {
+		pieces[captured] &= ~toMask;
+		occ &= ~toMask;
+	}
+
+	pieces[movedAfterCapture] |= toMask;
+	occ |= toMask;
+
+	bool movedWhite = isWhitePieceFast(move.moved);
+	if (hasLegalRecaptureTo(pieces, occ, move.to, !movedWhite, movedAfterCapture)) {
+		gain -= pieceValueCp(movedAfterCapture);
+	}
+
+#ifdef ENABLE_ENGINE_PROFILING
+	profileApproximateSeeResult(gain);
+#endif
 
 	return gain;
+}
+
+static int scoreCaptureWithSee(const Move& m, int see)
+{
+	Piece captured = capturedPieceForMove(m);
+	int victim = pieceValueSimple[captured];
+	int attacker = pieceValueSimple[m.moved];
+	if (see >= 0) {
+		return 650000 + see + (victim * 100 - attacker);
+	}
+	return 150000 + see + (victim * 100 - attacker);
 }
 
 
@@ -648,38 +930,45 @@ static const int kingPST[64] =
 int Engine::scoreMove(const Move& m, const board& b, int ply,
 	bool haveTTMove, const Move& ttMove)
 {
+	PROFILE_INC(::Profiler::ScoreMoveCalls);
+
 	ply = std::clamp(ply, 0, MAX_DEPTH - 1);
 
 	// 1. TT move first, even when the stored entry is shallow.
 	if (haveTTMove && sameMoveIdentity(m, ttMove)) {
+		PROFILE_INC(::Profiler::TTMoveScoreHits);
 		return 1000000;
 	}
 
 	if (m.wasPromotion) {
+		PROFILE_INC(::Profiler::PromotionScored);
 		return 850000 + pieceValueCp(m.promotedTo) + (m.captured != EMPTY ? pieceValueCp(m.captured) : 0);
 	}
 
 	// 2. Winning/equal captures are searched before quiet moves; losing
 	// captures are delayed so quiet refutations are not buried behind MVV-LVA.
 	if (m.captured != EMPTY) {
+		PROFILE_INC(::Profiler::CaptureScored);
 		int see = approximateSee(b, moveGenerator, m);
-		int victim = pieceValueSimple[m.captured];
-		int attacker = pieceValueSimple[m.moved];
-		if (see >= 0) {
-			return 650000 + see + (victim * 100 - attacker);
-		}
-		return 150000 + see + (victim * 100 - attacker);
+		return scoreCaptureWithSee(m, see);
 	}
 
-	// 3. Killer moves are quiet beta-cutoff moves from the same ply.
-	if (sameMoveIdentity(killerMoves[ply][0], m))
-		return 400000;
+	PROFILE_INC(::Profiler::QuietScored);
 
-	if (sameMoveIdentity(killerMoves[ply][1], m))
+	// 3. Killer moves are quiet beta-cutoff moves from the same ply.
+	if (sameMoveIdentity(killerMoves[ply][0], m)) {
+		PROFILE_INC(::Profiler::KillerScored);
+		return 400000;
+	}
+
+	if (sameMoveIdentity(killerMoves[ply][1], m)) {
+		PROFILE_INC(::Profiler::KillerScored);
 		return 390000;
+	}
 
 	// 4. Quiet moves use side-aware history scores.
 	int side = b.isWhiteTurn ? 0 : 1;
+	PROFILE_INC(::Profiler::HistoryScored);
 	return std::clamp(historyHeuristic[side][m.from][m.to], -200000, 350000);
 }
 
@@ -688,6 +977,9 @@ int Engine::scoreMove(const Move& m, const board& b, int ply,
 // ==========================================================
 int Engine::evaluate(board& b)
 {
+	PROFILE_INC(::Profiler::EvalCalls);
+	PROFILE_TIMER(::Profiler::EvalTime);
+
 	int score = 0;
 
 	// ----------------------------------------------------------
@@ -730,204 +1022,192 @@ int Engine::evaluate(board& b)
 	// ----------------------------------------------------------
 	// MATERIAL + PST
 	// ----------------------------------------------------------
-	for (int p = BQ; p <= WB; ++p)
 	{
-		int n = b.pieceCount[p];
-		const int* list = b.pieceList[p];
-		int mv = matVal[p];
+		PROFILE_TIMER(::Profiler::EvalMaterialPstTime);
+		for (int p = BQ; p <= WB; ++p)
+		{
+			int n = b.pieceCount[p];
+			const int* list = b.pieceList[p];
+			int mv = matVal[p];
 
-		for (int i = 0; i < n; i++) {
-			int sq = list[i];
-			score += mv;
-			score += pst((Piece)p, sq);
+			for (int i = 0; i < n; i++) {
+				int sq = list[i];
+				score += mv;
+				score += pst((Piece)p, sq);
+			}
 		}
 	}
 
 	// ----------------------------------------------------------
 	// MOBILITY
 	// ----------------------------------------------------------
-	for (int i = 0; i < b.pieceCount[WN]; i++) score += knightMob[b.pieceList[WN][i]];
-	for (int i = 0; i < b.pieceCount[BN]; i++) score -= knightMob[b.pieceList[BN][i]];
+	{
+		PROFILE_TIMER(::Profiler::EvalMobilityActivityTime);
+		for (int i = 0; i < b.pieceCount[WN]; i++) score += knightMob[b.pieceList[WN][i]];
+		for (int i = 0; i < b.pieceCount[BN]; i++) score -= knightMob[b.pieceList[BN][i]];
 
-	for (int i = 0; i < b.pieceCount[WB]; i++) score += bishopMob[b.pieceList[WB][i]];
-	for (int i = 0; i < b.pieceCount[BB]; i++) score -= bishopMob[b.pieceList[BB][i]];
+		for (int i = 0; i < b.pieceCount[WB]; i++) score += bishopMob[b.pieceList[WB][i]];
+		for (int i = 0; i < b.pieceCount[BB]; i++) score -= bishopMob[b.pieceList[BB][i]];
 
-	for (int i = 0; i < b.pieceCount[WR]; i++) score += rookMob[b.pieceList[WR][i]];
-	for (int i = 0; i < b.pieceCount[BR]; i++) score -= rookMob[b.pieceList[BR][i]];
+		for (int i = 0; i < b.pieceCount[WR]; i++) score += rookMob[b.pieceList[WR][i]];
+		for (int i = 0; i < b.pieceCount[BR]; i++) score -= rookMob[b.pieceList[BR][i]];
+	}
 
 	// ----------------------------------------------------------
 	// PAWN STRUCTURE ? Passed pawns
 	// ----------------------------------------------------------
-	auto isPassed = [&](int sq, bool white)
-		{
-			int file = sq & 7;
-			int rank = sq >> 3;
+	{
+		PROFILE_TIMER(::Profiler::EvalPassedPawnTime);
+		auto isPassed = [&](int sq, bool white)
+			{
+				int file = sq & 7;
+				int rank = sq >> 3;
 
-			if (white) {
-				for (int i = 0; i < b.pieceCount[BP]; i++) {
-					int psq = b.pieceList[BP][i];
-					if (abs((psq & 7) - file) <= 1 && (psq >> 3) < rank)
-						return false;
+				if (white) {
+					for (int i = 0; i < b.pieceCount[BP]; i++) {
+						int psq = b.pieceList[BP][i];
+						if (abs((psq & 7) - file) <= 1 && (psq >> 3) < rank)
+							return false;
+					}
+					return true;
 				}
-				return true;
-			}
-			else {
-				for (int i = 0; i < b.pieceCount[WP]; i++) {
-					int psq = b.pieceList[WP][i];
-					if (abs((psq & 7) - file) <= 1 && (psq >> 3) > rank)
-						return false;
+				else {
+					for (int i = 0; i < b.pieceCount[WP]; i++) {
+						int psq = b.pieceList[WP][i];
+						if (abs((psq & 7) - file) <= 1 && (psq >> 3) > rank)
+							return false;
+					}
+					return true;
 				}
-				return true;
-			}
-		};
+			};
 
-	// White passed pawns
-	for (int i = 0; i < b.pieceCount[WP]; i++) {
-		int sq = b.pieceList[WP][i];
-		// White advances toward smaller board rows, so invert the row index.
-		int advancedRanks = 7 - (sq >> 3);
-		if (isPassed(sq, true)) score += 40 + 10 * advancedRanks;
-	}
+		// White passed pawns
+		for (int i = 0; i < b.pieceCount[WP]; i++) {
+			int sq = b.pieceList[WP][i];
+			// White advances toward smaller board rows, so invert the row index.
+			int advancedRanks = 7 - (sq >> 3);
+			if (isPassed(sq, true)) score += 40 + 10 * advancedRanks;
+		}
 
-	// Black passed pawns
-	for (int i = 0; i < b.pieceCount[BP]; i++) {
-		int sq = b.pieceList[BP][i];
-		// Black advances toward larger board rows.
-		int advancedRanks = sq >> 3;
-		if (isPassed(sq, false)) score -= 40 + 10 * advancedRanks;
+		// Black passed pawns
+		for (int i = 0; i < b.pieceCount[BP]; i++) {
+			int sq = b.pieceList[BP][i];
+			// Black advances toward larger board rows.
+			int advancedRanks = sq >> 3;
+			if (isPassed(sq, false)) score -= 40 + 10 * advancedRanks;
+		}
 	}
 
 	// ----------------------------------------------------------
 	// DOUBLED PAWNS
 	// ----------------------------------------------------------
-	int wFileCnt[8] = { 0 }, bFileCnt[8] = { 0 };
+	{
+		PROFILE_TIMER(::Profiler::EvalPawnStructureTime);
+		int wFileCnt[8] = { 0 }, bFileCnt[8] = { 0 };
 
-	for (int i = 0; i < b.pieceCount[WP]; i++)
-		wFileCnt[b.pieceList[WP][i] & 7]++;
+		for (int i = 0; i < b.pieceCount[WP]; i++)
+			wFileCnt[b.pieceList[WP][i] & 7]++;
 
-	for (int i = 0; i < b.pieceCount[BP]; i++)
-		bFileCnt[b.pieceList[BP][i] & 7]++;
+		for (int i = 0; i < b.pieceCount[BP]; i++)
+			bFileCnt[b.pieceList[BP][i] & 7]++;
 
-	for (int f = 0; f < 8; f++) {
-		if (wFileCnt[f] > 1) score -= 15 * (wFileCnt[f] - 1);
-		if (bFileCnt[f] > 1) score += 15 * (bFileCnt[f] - 1);
+		for (int f = 0; f < 8; f++) {
+			if (wFileCnt[f] > 1) score -= 15 * (wFileCnt[f] - 1);
+			if (bFileCnt[f] > 1) score += 15 * (bFileCnt[f] - 1);
+		}
 	}
 
 	// ----------------------------------------------------------
 	// KING SAFETY (big Elo booster)
 	// ----------------------------------------------------------
-	int wKing = b.pieceList[WK][0];
-	int bKing = b.pieceList[BK][0];
-
-	// King zone relative offsets
-	static const int kingZone[12][2] = {
-		{-1,-1},{-1,0},{-1,1},
-		{0,-1},        {0,1},
-		{1,-1},{1,0},{1,1},
-		{-2,0}, {-1,-2}, {-1,2}, {2,0}
-	};
-
-	// Attack counts
-	int atkWhiteKing = 0;
-	int atkBlackKing = 0;
-
-	auto add_attacks = [&](int kingSq, bool kingIsWhite)
-		{
-			int r = kingSq >> 3, c = kingSq & 7;
-			for (auto& d : kingZone)
-			{
-				int nr = r + d[0], nc = c + d[1];
-				if (nr < 0 || nr > 7 || nc < 0 || nc > 7) continue;
-				int sq = nr * 8 + nc;
-
-				// Count enemy attacks on the king zone; the old code computed checks but never used them.
-				if (moveGenerator->isSquareAttacked(b, sq, !kingIsWhite)) {
-					if (kingIsWhite) {
-						++atkWhiteKing;
-					}
-					else {
-						++atkBlackKing;
-					}
-				}
-			}
-		};
-
-	add_attacks(wKing, true);
-	add_attacks(bKing, false);
-
-	score -= atkWhiteKing * 20;
-	score += atkBlackKing * 20;
-
-	// ----------------------------------------------------------
-	// KING PAWN SHIELD
-	// ----------------------------------------------------------
-	auto pawnShield = [&](int ksq, bool isWhite) {
-		int r = ksq >> 3, c = ksq & 7;
-		int s = 0;
-
-		// The shield is on the rank in front of the king, including back-rank castled kings.
-		if (isWhite && r > 0)
-		{
-			int front = r - 1;
-			if (b.pieceAt(front * 8 + c) == WP) s += 15;
-			if (c > 0 && b.pieceAt(front * 8 + c - 1) == WP) s += 10;
-			if (c < 7 && b.pieceAt(front * 8 + c + 1) == WP) s += 10;
-		}
-		else if (!isWhite && r < 7)
-		{
-			int front = r + 1;
-			if (b.pieceAt(front * 8 + c) == BP) s += 15;
-			if (c > 0 && b.pieceAt(front * 8 + c - 1) == BP) s += 10;
-			if (c < 7 && b.pieceAt(front * 8 + c + 1) == BP) s += 10;
-		}
-		return s;
-		};
-
-	score += pawnShield(wKing, true);
-	score -= pawnShield(bKing, false);
-
-	// ----------------------------------------------------------
-	// OPEN FILES NEAR KING
-	// ----------------------------------------------------------
-	auto fileHasPawn = [&](int f, bool white) {
-		int cnt = white ? b.pieceCount[WP] : b.pieceCount[BP];
-		int p = white ? WP : BP;
-		for (int i = 0; i < cnt; i++)
-			if ((b.pieceList[p][i] & 7) == f)
-				return true;
-		return false;
-		};
-
-	auto kingOpenPenalty = [&](int ksq, bool white) {
-		int f = ksq & 7;
-		int s = 0;
-		if (!fileHasPawn(f, white)) s -= 15;
-		if (f > 0 && !fileHasPawn(f - 1, white)) s -= 10;
-		if (f < 7 && !fileHasPawn(f + 1, white)) s -= 10;
-		return s;
-		};
-
-	score += kingOpenPenalty(wKing, true);
-	score -= kingOpenPenalty(bKing, false);
-
-	// ----------------------------------------------------------
-	// CASTLED BONUS
-	// ----------------------------------------------------------
-	if (wKing == 62 || wKing == 58) score += 40;
-	if (bKing == 6 || bKing == 2) score -= 40;
-
-	// ----------------------------------------------------------
-	// KING IN CENTER AFTER MOVE 10
-	// ----------------------------------------------------------
-	auto isCenter = [&](int sq) {
-		int r = sq >> 3, c = sq & 7;
-		return (r >= 2 && r <= 5 && c >= 2 && c <= 5);
-		};
-
-	if (b.fullmoveNumber > 10)
 	{
-		if (isCenter(wKing)) score -= 40;
-		if (isCenter(bKing)) score += 40;
+		PROFILE_TIMER(::Profiler::EvalKingSafetyTime);
+		int wKing = b.pieceList[WK][0];
+		int bKing = b.pieceList[BK][0];
+
+		Bitboard whiteAttacks = attackMapForSide(b, true);
+		Bitboard blackAttacks = attackMapForSide(b, false);
+		int atkWhiteKing = Bitboards::popcount(kingSafetyZoneMask(wKing) & blackAttacks);
+		int atkBlackKing = Bitboards::popcount(kingSafetyZoneMask(bKing) & whiteAttacks);
+
+		score -= atkWhiteKing * 20;
+		score += atkBlackKing * 20;
+
+		// ----------------------------------------------------------
+		// KING PAWN SHIELD
+		// ----------------------------------------------------------
+		auto pawnShield = [&](int ksq, bool isWhite) {
+			int r = ksq >> 3, c = ksq & 7;
+			int s = 0;
+
+			// The shield is on the rank in front of the king, including back-rank castled kings.
+			if (isWhite && r > 0)
+			{
+				int front = r - 1;
+				if (b.pieceAt(front * 8 + c) == WP) s += 15;
+				if (c > 0 && b.pieceAt(front * 8 + c - 1) == WP) s += 10;
+				if (c < 7 && b.pieceAt(front * 8 + c + 1) == WP) s += 10;
+			}
+			else if (!isWhite && r < 7)
+			{
+				int front = r + 1;
+				if (b.pieceAt(front * 8 + c) == BP) s += 15;
+				if (c > 0 && b.pieceAt(front * 8 + c - 1) == BP) s += 10;
+				if (c < 7 && b.pieceAt(front * 8 + c + 1) == BP) s += 10;
+			}
+			return s;
+			};
+
+		score += pawnShield(wKing, true);
+		score -= pawnShield(bKing, false);
+
+		// ----------------------------------------------------------
+		// OPEN FILES NEAR KING
+		// ----------------------------------------------------------
+		bool wPawnFiles[8] = { false };
+		bool bPawnFiles[8] = { false };
+		for (int i = 0; i < b.pieceCount[WP]; i++) {
+			wPawnFiles[b.pieceList[WP][i] & 7] = true;
+		}
+		for (int i = 0; i < b.pieceCount[BP]; i++) {
+			bPawnFiles[b.pieceList[BP][i] & 7] = true;
+		}
+
+		auto fileHasPawn = [&](int f, bool white) {
+			return white ? wPawnFiles[f] : bPawnFiles[f];
+			};
+
+		auto kingOpenPenalty = [&](int ksq, bool white) {
+			int f = ksq & 7;
+			int s = 0;
+			if (!fileHasPawn(f, white)) s -= 15;
+			if (f > 0 && !fileHasPawn(f - 1, white)) s -= 10;
+			if (f < 7 && !fileHasPawn(f + 1, white)) s -= 10;
+			return s;
+			};
+
+		score += kingOpenPenalty(wKing, true);
+		score -= kingOpenPenalty(bKing, false);
+
+		// ----------------------------------------------------------
+		// CASTLED BONUS
+		// ----------------------------------------------------------
+		if (wKing == 62 || wKing == 58) score += 40;
+		if (bKing == 6 || bKing == 2) score -= 40;
+
+		// ----------------------------------------------------------
+		// KING IN CENTER AFTER MOVE 10
+		// ----------------------------------------------------------
+		auto isCenter = [&](int sq) {
+			int r = sq >> 3, c = sq & 7;
+			return (r >= 2 && r <= 5 && c >= 2 && c <= 5);
+			};
+
+		if (b.fullmoveNumber > 10)
+		{
+			if (isCenter(wKing)) score -= 40;
+			if (isCenter(bKing)) score += 40;
+		}
 	}
 
 	// ----------------------------------------------------------
@@ -957,6 +1237,20 @@ static void selectBestScoredMove(Move* moves, int* scores, int index, int count)
 	}
 }
 
+#ifdef ENABLE_ENGINE_PROFILING
+static Profiler::CounterId profileCutoffMoveIndexCounter(int moveIndex)
+{
+	if (moveIndex <= 0) return Profiler::CutoffMoveIndex0;
+	if (moveIndex == 1) return Profiler::CutoffMoveIndex1;
+	if (moveIndex == 2) return Profiler::CutoffMoveIndex2;
+	if (moveIndex == 3) return Profiler::CutoffMoveIndex3;
+	if (moveIndex == 4) return Profiler::CutoffMoveIndex4;
+	if (moveIndex <= 7) return Profiler::CutoffMoveIndex5To7;
+	if (moveIndex <= 15) return Profiler::CutoffMoveIndex8To15;
+	return Profiler::CutoffMoveIndex16Plus;
+}
+#endif // ENABLE_ENGINE_PROFILING
+
 
 
 Move Engine::findBestMove(board& b, int maxDepth,
@@ -984,7 +1278,11 @@ Move Engine::findBestMove(board& b, int maxDepth,
 		repHistory.push_back(currentKey);
 	}
 
-	auto rootMoves = moveGenerator->generateLegalMoves(b);
+	std::vector<Move> rootMoves;
+	{
+		PROFILE_MOVEGEN_CONTEXT(Root);
+		rootMoves = moveGenerator->generateLegalMoves(b);
+	}
 	if (!rootMoveFilter.empty()) {
 		std::vector<Move> filtered;
 		filtered.reserve(rootMoveFilter.size());
@@ -1007,13 +1305,13 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	}
 
 	if (rootMoveFilter.empty()) {
-		Move bookMove = probeBook(b);
+		/*Move bookMove = probeBook(b);
 		if (bookMove.from != -1) {
 			Move legalBookMove;
 			if (findLegalEquivalent(rootMoves, bookMove, legalBookMove)) {
 				return legalBookMove;
 			}
-		}
+		}*/
 	}
 
 	if(rootMoves.size() == 1)
@@ -1339,6 +1637,12 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	depth = std::clamp(depth, 0, MAX_DEPTH - 1);
 	const int tablePly = std::clamp(ply, 0, MAX_DEPTH - 1);
 	totalNodes++;
+	PROFILE_INC(::Profiler::SearchNodes);
+#ifdef ENABLE_ENGINE_PROFILING
+	const int profilePly = std::clamp(ply, 0, Profiler::MAX_PROFILE_PLY - 1);
+	PROFILE_MAX(::Profiler::MaxPly, profilePly);
+	PROFILE_ADD(::Profiler::NodesByPly0 + profilePly, 1);
+#endif
 
 	if (shouldStop()) {
 		return SEARCH_ABORTED;
@@ -1367,6 +1671,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	// Leaf ? quiescence search
 	if (depth == 0) {
 		leafNodes++;
+		PROFILE_INC(::Profiler::LeafNodes);
 		return quiescence(b, alpha, beta, ply, 0, repHistory);
 	}
 
@@ -1377,12 +1682,26 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	// TRANSPOSITION TABLE PROBE
 	// -------------------------------
 	TTEntry* entry = (tt != nullptr && ttSize != 0) ? &tt[key & ttMask] : nullptr;
+	if (entry != nullptr) {
+		PROFILE_INC(::Profiler::TTProbes);
+	}
 
 	Move ttMove;
 	bool haveTTMove = false;
 
 	if (entry != nullptr && entry->flag != TT_EMPTY && entry->key == key)
 	{
+		PROFILE_INC(::Profiler::TTHits);
+		if (entry->flag == TT_EXACT) {
+			PROFILE_INC(::Profiler::TTExactHits);
+		}
+		else if (entry->flag == TT_ALPHA) {
+			PROFILE_INC(::Profiler::TTAlphaHits);
+		}
+		else if (entry->flag == TT_BETA) {
+			PROFILE_INC(::Profiler::TTBetaHits);
+		}
+
 		// Always keep the stored best move for ordering, even from shallow entries.
 		ttMove = entry->bestMove;
 		haveTTMove = ttMove.from != -1 && ttMove.to != -1;
@@ -1390,14 +1709,23 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		if (entry->depth >= depth) {
 			int stored = scoreFromTT(entry->score, ply);
 
-			if (entry->flag == TT_EXACT)
+			if (entry->flag == TT_EXACT) {
+				PROFILE_INC(::Profiler::TTCutoffs);
 				return stored;
-			else if (entry->flag == TT_ALPHA && stored <= alpha)
+			}
+			else if (entry->flag == TT_ALPHA && stored <= alpha) {
+				PROFILE_INC(::Profiler::TTCutoffs);
 				return stored;
-			else if (entry->flag == TT_BETA && stored >= beta)
+			}
+			else if (entry->flag == TT_BETA && stored >= beta) {
+				PROFILE_INC(::Profiler::TTCutoffs);
 				return stored;
+			}
 		}
 
+	}
+	else if (entry != nullptr) {
+		PROFILE_INC(::Profiler::TTMisses);
 	}
 
 	// Avoid tablebase overhead in the normal hot path; count pieces only when
@@ -1413,6 +1741,10 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 
 			if (tt != nullptr && ttSize != 0) {
 				TTEntry& tbEntry = tt[key & ttMask];
+				PROFILE_INC(::Profiler::TTStores);
+				if (tbEntry.flag != TT_EMPTY) {
+					PROFILE_INC(::Profiler::TTOverwrites);
+				}
 				tbEntry.key = key;
 				tbEntry.score = scoreToTT(tbScore, ply);
 				tbEntry.depth = 127;     // highest possible depth
@@ -1429,8 +1761,14 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	// -------------------------------
 	// IN-CHECK DETECTION
 	// -------------------------------
-	int kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
-	bool inCheck = moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
+	int kingSq = -1;
+	bool inCheck = false;
+	{
+		PROFILE_INC(::Profiler::InCheckCalls);
+		PROFILE_TIMER(::Profiler::InCheckTime);
+		kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
+		inCheck = moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
+	}
 
 
 
@@ -1456,6 +1794,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		}
 
 		if (hasNonPawnMaterial) {
+			PROFILE_INC(::Profiler::NullMoveAttempts);
 			int staticEval = evaluate(b);
 			// Save state we touch
 			bool prevTurn = b.isWhiteTurn;
@@ -1497,6 +1836,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 
 			// Fail-high ? position is so good we can prune
 			if (score >= beta) {
+				PROFILE_INC(::Profiler::NullMoveCutoffs);
 				return score;
 			}
 		}
@@ -1505,7 +1845,10 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	// NORMAL MOVE GENERATION
 	// -------------------------------
 	MoveList moves;
-	moveGenerator->generateLegalMoves(b, moves);
+	{
+		PROFILE_MOVEGEN_CONTEXT(Search);
+		moveGenerator->generateLegalMoves(b, moves);
+	}
 
 	// No legal moves ? checkmate or stalemate
 	if (moves.count == 0) {
@@ -1522,10 +1865,13 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	int scores[MoveList::MAX_MOVES];
 	Move* moveData = moves.data();
 
-	for (int i = 0; i < moves.count; ++i)
 	{
-		Move& m = moveData[i];
-		scores[i] = scoreMove(m, b, tablePly, haveTTMove, ttMove);
+		PROFILE_SEE_CONTEXT(MoveOrdering);
+		for (int i = 0; i < moves.count; ++i)
+		{
+			Move& m = moveData[i];
+			scores[i] = scoreMove(m, b, tablePly, haveTTMove, ttMove);
+		}
 	}
 
 	int besteval = -INF;
@@ -1551,8 +1897,14 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		// CHECK EXTENSION: does this move give check?
 		// After makeMove, b.isWhiteTurn is the opponent's turn.
 		// So we find the opponent king and see if it's attacked
-		int oppKingSq = moveGenerator->findKing(b, b.isWhiteTurn);
-		bool givesCheck = moveGenerator->isSquareAttacked(b, oppKingSq, !b.isWhiteTurn);
+		int oppKingSq = -1;
+		bool givesCheck = false;
+		{
+			PROFILE_INC(::Profiler::InCheckCalls);
+			PROFILE_TIMER(::Profiler::InCheckTime);
+			oppKingSq = moveGenerator->findKing(b, b.isWhiteTurn);
+			givesCheck = moveGenerator->isSquareAttacked(b, oppKingSq, !b.isWhiteTurn);
+		}
 
 		bool isTTMove = false;
 		if (haveTTMove &&
@@ -1560,6 +1912,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 			move.to == ttMove.to &&
 			move.moved == ttMove.moved)
 		{
+			PROFILE_INC(::Profiler::TTMoveTried);
 			isTTMove = true;
 		}
 
@@ -1576,12 +1929,14 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 			extension = 1;
 		}
 		if (extension != 0) {
+			PROFILE_INC(::Profiler::CheckExtensions);
 			newDepth++;
 		}
 
 		// ---------------------------------------
 		// LATE MOVE PRUNING (LMP)
 
+		PROFILE_INC(::Profiler::LmpAttempts);
 
 		if (!isCapture &&
 			!move.wasPromotion &&
@@ -1595,6 +1950,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 			!isKiller &&
 			historyHeuristic[b.isWhiteTurn ? 0 : 1][move.from][move.to] < 12000)
 		{
+			PROFILE_INC(::Profiler::LmpPrunes);
 			// LMP is forward pruning. Once a legal move is skipped, this node
 			// must not be stored as a fully searched TT bound.
 			selectivelyPruned = true;
@@ -1614,6 +1970,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		//  - not in check already
 		//  - move itself does NOT give check
 		// ---------------------------------------
+		PROFILE_INC(::Profiler::LmrAttempts);
 		if (newDepth > 0 &&
 			depth >= 3 &&
 			moveIndex >= 3 &&
@@ -1624,6 +1981,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 			!isTTMove &&
 			!isKiller)
 		{
+			PROFILE_INC(::Profiler::LmrApplied);
 			int R = 1;
 			if (depth >= 6 && moveIndex >= 6) {
 				++R;
@@ -1646,6 +2004,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 
 			// If it looks better than alpha, research at full depth
 			if (eval > alpha) {
+				PROFILE_INC(::Profiler::LmrResearches);
 				childScore = search(b, newDepth,
 					-beta, -alpha,
 					ply + 1, repHistory, pvNode, extensionCount + extension);
@@ -1660,6 +2019,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		else {
 			int childScore;
 			if (usePvs) {
+				PROFILE_INC(::Profiler::PvsAttempts);
 				// PVS: late moves get a null-window probe before a full re-search.
 				childScore = search(b, newDepth,
 					-alpha - 1, -alpha,
@@ -1672,6 +2032,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 				eval = -childScore;
 
 				if (eval > alpha && eval < beta) {
+					PROFILE_INC(::Profiler::PvsResearches);
 					childScore = search(b, newDepth,
 						-beta, -alpha,
 						ply + 1, repHistory, pvNode, extensionCount + extension);
@@ -1699,6 +2060,14 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		
 		firstMove = false;
 		++searchedMoves;
+#ifdef ENABLE_ENGINE_PROFILING
+		if (isCapture) {
+			PROFILE_INC(::Profiler::CaptureMovesSearched);
+		}
+		else if (isQuietMove(move)) {
+			PROFILE_INC(::Profiler::QuietMovesSearched);
+		}
+#endif
 		b.unmakeMove(move, u);
 
 		// ------------------------------
@@ -1710,11 +2079,22 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		}
 
 		if (eval > alpha) {
+			PROFILE_INC(::Profiler::AlphaRaises);
 			alpha = eval;
 		}
 
 		// Alpha–beta cutoff
 		if (alpha >= beta) {
+			PROFILE_INC(::Profiler::BetaCutoffs);
+#ifdef ENABLE_ENGINE_PROFILING
+			if (searchedMoves == 1) {
+				PROFILE_INC(::Profiler::FirstMoveBetaCutoffs);
+			}
+			if (isTTMove) {
+				PROFILE_INC(::Profiler::TTMoveCutoffs);
+			}
+			PROFILE_INC(profileCutoffMoveIndexCounter(moveIndex));
+#endif
 			if (isQuietMove(move)) {
 				// Quiet beta cutoffs update killer and side-aware history tables.
 				if (!sameMoveIdentity(killerMoves[tablePly][0], move)) {
@@ -1750,7 +2130,13 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 
 	TTEntry& store = tt[key & ttMask];
 	if (store.flag != TT_EMPTY && store.key != key && store.depth > depth + 2) {
+		PROFILE_INC(::Profiler::TTKeptDueToDepth);
 		return besteval;
+	}
+
+	PROFILE_INC(::Profiler::TTStores);
+	if (store.flag != TT_EMPTY) {
+		PROFILE_INC(::Profiler::TTOverwrites);
 	}
 
 	store.key = key;
@@ -1774,6 +2160,21 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	std::vector<uint64_t>& repHistory)
 {
 	totalNodes++;  // still count these as nodes
+	PROFILE_INC(::Profiler::QSearchNodes);
+#ifdef ENABLE_ENGINE_PROFILING
+	const int profileQply = std::clamp(qply, 0, Profiler::MAX_PROFILE_PLY - 1);
+	PROFILE_MAX(::Profiler::QSearchMaxPly, profileQply);
+	PROFILE_ADD(::Profiler::QNodesByPly0 + profileQply, 1);
+	if (qply >= 8) {
+		PROFILE_INC(::Profiler::QNodesAtOrBeyondPly8);
+	}
+	if (qply >= 12) {
+		PROFILE_INC(::Profiler::QNodesAtOrBeyondPly12);
+	}
+	if (qply >= 16) {
+		PROFILE_INC(::Profiler::QNodesAtOrBeyondPly16);
+	}
+#endif
 	constexpr int MaxQSearchPly = 24;
 	constexpr int MaxQuietCheckQply = 4;
 	constexpr int DeltaMargin = 150;
@@ -1794,18 +2195,80 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	}
 	RepetitionFrame repetitionFrame(repHistory, key);
 
-	int kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
-	bool inCheck = kingSq != -1 &&
-		moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
+	int kingSq = -1;
+	bool inCheck = false;
+	{
+		PROFILE_INC(::Profiler::InCheckCalls);
+		PROFILE_TIMER(::Profiler::InCheckTime);
+		kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
+		inCheck = kingSq != -1 &&
+			moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
+	}
+#ifdef ENABLE_ENGINE_PROFILING
+	if (inCheck) {
+		PROFILE_INC(::Profiler::QSearchInCheckCalls);
+		PROFILE_INC(::Profiler::QInCheckEvasionNodes);
+	}
+	else {
+		PROFILE_INC(::Profiler::QNonCheckNodes);
+	}
+#endif
+
+	int standPat = 0;
+	if (!inCheck) {
+		if (qply >= MaxQSearchPly) {
+			PROFILE_INC(::Profiler::QMaxPlyHits);
+			PROFILE_INC(::Profiler::QMaxPlyLimitReturns);
+			return evaluate(b);
+		}
+
+		// Stand-pat evaluation: assume the quiet position can be held.
+		PROFILE_INC(::Profiler::QStandPatEvaluations);
+		standPat = evaluate(b);
+
+		// Fail-high: too good for the opponent.
+		if (standPat >= beta) {
+			PROFILE_INC(::Profiler::StandPatBetaCutoffs);
+			return standPat;
+		}
+
+		if (standPat > alpha) {
+			PROFILE_INC(::Profiler::StandPatAlphaRaises);
+			alpha = standPat;
+		}
+	}
 
 	MoveList moves;
-	moveGenerator->generateQuiescenceMoves(b, moves);
+	{
+		PROFILE_MOVEGEN_CONTEXT(Qsearch);
+		moveGenerator->generateQuiescenceMoves(b, moves);
+	}
+#ifdef ENABLE_ENGINE_PROFILING
+	PROFILE_ADD(::Profiler::QGeneratedMovesTotal, moves.count);
+	PROFILE_ADD(::Profiler::QCandidateMoves, moves.count);
+	for (const Move& generated : moves) {
+		if (generated.captured != EMPTY || generated.wasEnPassant) {
+			PROFILE_INC(::Profiler::QCapturesGenerated);
+		}
+		if (generated.wasPromotion) {
+			PROFILE_INC(::Profiler::QPromotionsGenerated);
+		}
+		if (!inCheck &&
+			generated.captured == EMPTY &&
+			!generated.wasEnPassant &&
+			!generated.wasPromotion) {
+			PROFILE_INC(::Profiler::QQuietChecksGenerated);
+		}
+	}
+#endif
 
 	if (inCheck && moves.count == 0) {
 		return -MATE_SCORE + ply;
 	}
 
-	if (qply >= MaxQSearchPly) {
+	if (inCheck && qply >= MaxQSearchPly) {
+		PROFILE_INC(::Profiler::QMaxPlyHits);
+		PROFILE_INC(::Profiler::QMaxPlyLimitReturns);
 		return evaluate(b);
 	}
 
@@ -1816,52 +2279,68 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	if (inCheck) {
 		// Stand-pat is illegal while in check; search every legal evasion.
 		searchCount = moves.count;
+		PROFILE_ADD(::Profiler::QMovesAfterPruning, searchCount);
+		PROFILE_SEE_CONTEXT(QsearchMoveOrdering);
 		for (int i = 0; i < searchCount; ++i) {
 			qMoves[i] = moves.data()[i];
 			scores[i] = scoreMove(qMoves[i], b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move());
 		}
 	}
 	else {
-		// Stand-pat evaluation: assume the quiet position can be held.
-		int standPat = evaluate(b);
-
-		// Fail-high: too good for the opponent
-		if (standPat >= beta)
-			return standPat;
-
-		if (standPat > alpha)
-			alpha = standPat;
-
 		const bool alphaIsNormal = alpha > -MATE_THRESHOLD && alpha < MATE_THRESHOLD;
 		for (auto& m : moves) {
-			bool tactical = (m.captured != EMPTY) || m.wasEnPassant || m.wasPromotion;
+			bool isCapture = (m.captured != EMPTY) || m.wasEnPassant;
+			bool tactical = isCapture || m.wasPromotion;
 			if (!tactical) {
 				if (qply >= MaxQuietCheckQply) {
+					PROFILE_INC(::Profiler::QMovesSkippedNotCaptureOrPromotionOrCheck);
 					continue;
 				}
 
 				qMoves[searchCount] = m;
-				scores[searchCount] = 250000 +
-					std::clamp(scoreMove(m, b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move()),
-						-50000, 50000);
+				{
+					PROFILE_SEE_CONTEXT(QsearchMoveOrdering);
+					scores[searchCount] = 250000 +
+						std::clamp(scoreMove(m, b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move()),
+							-50000, 50000);
+				}
 				++searchCount;
+				PROFILE_INC(::Profiler::QMovesAfterPruning);
 				continue;
 			}
 
 			int gain = pieceValueCp(m.captured) + promotionGainCp(m);
-			if (!m.wasPromotion && alphaIsNormal &&
-				standPat + gain + DeltaMargin <= alpha) {
-				continue;
+			if (!m.wasPromotion && alphaIsNormal) {
+				PROFILE_INC(::Profiler::QDeltaPruneAttempts);
+				if (standPat + gain + DeltaMargin <= alpha) {
+					PROFILE_INC(::Profiler::QDeltaPrunes);
+					continue;
+				}
 			}
 
-			int see = approximateSee(b, moveGenerator, m);
+			PROFILE_INC(::Profiler::QSeePruneAttempts);
+			int see;
+			{
+				PROFILE_SEE_CONTEXT(QsearchPruning);
+				see = approximateSee(b, moveGenerator, m);
+			}
 			if (!m.wasPromotion && see < -120) {
+				PROFILE_INC(::Profiler::QSeePrunes);
 				continue;
 			}
 
 			qMoves[searchCount] = m;
-			scores[searchCount] = scoreMove(m, b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move());
+			{
+				if (m.wasPromotion) {
+					scores[searchCount] = 850000 + pieceValueCp(m.promotedTo) +
+						(capturedPieceForMove(m) != EMPTY ? pieceValueCp(capturedPieceForMove(m)) : 0);
+				}
+				else {
+					scores[searchCount] = scoreCaptureWithSee(m, see);
+				}
+			}
 			++searchCount;
+			PROFILE_INC(::Profiler::QMovesAfterPruning);
 		}
 
 		if (searchCount == 0) {
@@ -1883,6 +2362,22 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 		}
 		const Move& m = qMoves[orderedIndex];
 
+		PROFILE_INC(::Profiler::QMovesSearched);
+		PROFILE_INC(::Profiler::QMovesActuallySearched);
+#ifdef ENABLE_ENGINE_PROFILING
+		if (m.captured != EMPTY || m.wasEnPassant) {
+			PROFILE_INC(::Profiler::QCapturesSearched);
+		}
+		if (m.wasPromotion) {
+			PROFILE_INC(::Profiler::QPromotionsSearched);
+		}
+		if (!inCheck &&
+			m.captured == EMPTY &&
+			!m.wasEnPassant &&
+			!m.wasPromotion) {
+			PROFILE_INC(::Profiler::QQuietChecksSearched);
+		}
+#endif
 		Unmove u = b.makeMove(m);
 		int childScore = quiescence(b, -beta, -alpha, ply + 1, qply + 1, repHistory);
 		if (isSearchAborted(childScore)) {
@@ -1894,11 +2389,15 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 
 		b.unmakeMove(m, u);
 
-		if (score >= beta)
+		if (score >= beta) {
+			PROFILE_INC(::Profiler::QBetaCutoffs);
 			return score;
+		}
 
-		if (score > alpha)
+		if (score > alpha) {
+			PROFILE_INC(::Profiler::QAlphaRaises);
 			alpha = score;
+		}
 	}
 
 	return alpha;

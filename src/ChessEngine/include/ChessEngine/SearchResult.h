@@ -28,7 +28,8 @@ enum class GameStatusKind {
     Ongoing,
     Checkmate,
     Stalemate,
-    FiftyMoveRule
+    FiftyMoveRule,
+    ThreefoldRepetition
 };
 
 struct GameStatus {

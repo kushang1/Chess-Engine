@@ -1,10 +1,13 @@
 #include "UciLoop.h"
 
+#include <ChessEngine/Profiler.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 
 #ifdef _WIN32
@@ -71,6 +74,41 @@ bool moveCanChangeCastlingRights(Piece piece, int from)
         (piece == BR && (from == 0 || from == 7));
 }
 
+struct BenchProfilePosition {
+    const char* label;
+    const char* fen;
+};
+
+constexpr int BenchProfileDepth = 4;
+
+constexpr BenchProfilePosition BenchProfilePositions[] = {
+    {
+        "startpos",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    },
+    {
+        "kiwipete",
+        "r3k2r/p1ppqpb1/bn2pnp1/2pP4/1p2P3/2N2N2/PPPB1PPP/R2QKB1R w KQkq - 0 1"
+    },
+    {
+        "middlegame",
+        "rnbq1rk1/ppp2ppp/3bpn2/3p4/3P4/2NBPN2/PPP2PPP/R1BQ1RK1 w - - 0 7"
+    },
+    {
+        "rook-endgame",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"
+    }
+};
+
+void setUciInfoOutput(bool enabled)
+{
+#ifdef _WIN32
+    _putenv_s("CHESS_ENGINE_UCI_INFO", enabled ? "1" : "0");
+#else
+    setenv("CHESS_ENGINE_UCI_INFO", enabled ? "1" : "0", 1);
+#endif
+}
+
 } // namespace
 
 UciLoop::UciLoop()
@@ -127,6 +165,12 @@ void UciLoop::handleCommand(const std::string& line)
     }
     else if (command == "go") {
         handleGo(tokens);
+    }
+    else if (command == "profile") {
+        handleProfile(tokens);
+    }
+    else if (command == "benchprofile") {
+        handleBenchProfile();
     }
     else if (command == "stop") {
         stopSearch();
@@ -258,6 +302,96 @@ void UciLoop::handlePerft(int depth)
         writeLine(moveToLongAlgebraic(entry.move) + ": " + std::to_string(entry.nodes));
     }
     writeLine("nodes " + std::to_string(nodes));
+}
+
+void UciLoop::handleProfile(const std::vector<std::string>& tokens)
+{
+    if (!Profiler::isCompiledIn()) {
+        writeLine("profiling not compiled in");
+        return;
+    }
+
+    if (tokens.size() < 2) {
+        writeLine("profile commands: reset report");
+        return;
+    }
+
+    const std::string& subcommand = tokens[1];
+    if (subcommand == "reset") {
+        stopSearch();
+        Profiler::reset();
+        writeLine("profile reset");
+    }
+    else if (subcommand == "report") {
+        stopSearch();
+        writeLine(Profiler::report());
+    }
+    else {
+        writeLine("profile commands: reset report");
+    }
+}
+
+void UciLoop::handleBenchProfile()
+{
+    stopSearch();
+
+    if (!Profiler::isCompiledIn()) {
+        writeLine("profiling not compiled in");
+        return;
+    }
+
+    Profiler::reset();
+    setUciInfoOutput(false);
+
+    chess::ChessEngine benchEngine;
+    benchEngine.setHashSizeMb(hashSizeMb);
+
+    writeLine("benchprofile depth " + std::to_string(BenchProfileDepth));
+    writeLine("index label depth bestmove score nodes qnodes time nps");
+
+    for (int i = 0; i < static_cast<int>(std::size(BenchProfilePositions)); ++i) {
+        const BenchProfilePosition& position = BenchProfilePositions[i];
+        if (!benchEngine.setPositionFromFen(position.fen)) {
+            writeLine(std::to_string(i + 1) + " " + position.label + " invalid-fen");
+            continue;
+        }
+
+        chess::SearchLimits limits;
+        limits.maxDepth = BenchProfileDepth;
+        limits.moveTimeMs = InfiniteMoveTimeMs;
+        limits.searchMoves = benchEngine.legalMoves();
+
+        uint64_t qnodesBefore = Profiler::value(Profiler::QSearchNodes);
+        chess::SearchResult result = benchEngine.findBestMove(
+            limits, std::vector<uint64_t>{ benchEngine.positionHash() });
+        uint64_t qnodesAfter = Profiler::value(Profiler::QSearchNodes);
+
+        long long elapsedMs = std::max(0, result.elapsedMs);
+        long long nps = elapsedMs > 0 ? (result.nodes * 1000LL) / elapsedMs : 0;
+
+        std::string line;
+        line.reserve(160);
+        line += std::to_string(i + 1);
+        line += " ";
+        line += position.label;
+        line += " depth ";
+        line += std::to_string(BenchProfileDepth);
+        line += " bestmove ";
+        line += benchEngine.moveToUci(result.bestMove);
+        line += " score n/a";
+        line += " nodes ";
+        line += std::to_string(result.nodes);
+        line += " qnodes ";
+        line += std::to_string(qnodesAfter - qnodesBefore);
+        line += " time ";
+        line += std::to_string(elapsedMs);
+        line += " nps ";
+        line += std::to_string(nps);
+        writeLine(line);
+    }
+
+    writeLine(Profiler::report());
+    setUciInfoOutput(true);
 }
 
 UciLoop::GoCommand UciLoop::parseGo(const std::vector<std::string>& tokens) const

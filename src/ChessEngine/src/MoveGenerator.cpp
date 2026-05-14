@@ -1,5 +1,7 @@
 ﻿#include "MoveGenerator.h"
 
+#include "Profiler.h"
+
 #include <array>
 
 namespace {
@@ -20,6 +22,43 @@ struct GenerationContext {
 };
 
 void generateMoves(board& b, MoveList& moves, bool legalOnly);
+
+#ifdef ENABLE_ENGINE_PROFILING
+void profileLegalMovegenContext() {
+    switch (Profiler::currentMovegenContext()) {
+    case Profiler::MovegenContext::Search:
+        PROFILE_INC(::Profiler::LegalMovegenFromSearch);
+        break;
+    case Profiler::MovegenContext::Qsearch:
+        PROFILE_INC(::Profiler::LegalMovegenFromQsearch);
+        break;
+    case Profiler::MovegenContext::See:
+        PROFILE_INC(::Profiler::LegalMovegenFromSEE);
+        break;
+    case Profiler::MovegenContext::Perft:
+        PROFILE_INC(::Profiler::LegalMovegenFromPerft);
+        break;
+    case Profiler::MovegenContext::Root:
+        PROFILE_INC(::Profiler::LegalMovegenFromRoot);
+        break;
+    case Profiler::MovegenContext::Other:
+    default:
+        PROFILE_INC(::Profiler::LegalMovegenOther);
+        break;
+    }
+}
+
+void profileQMovegenContext() {
+    switch (Profiler::currentMovegenContext()) {
+    case Profiler::MovegenContext::Qsearch:
+        PROFILE_INC(::Profiler::QMovegenFromQsearch);
+        break;
+    default:
+        PROFILE_INC(::Profiler::QMovegenOther);
+        break;
+    }
+}
+#endif // ENABLE_ENGINE_PROFILING
 
 inline bool isKingPiece(Piece p) {
     return p == WK || p == BK;
@@ -88,6 +127,8 @@ inline int updatedCastleRights(int currentRights, Piece moved, int from, Piece c
 }
 
 inline Bitboard attackersTo(const board& b, int sq, bool byWhite, Bitboard occ) {
+    PROFILE_INC(::Profiler::AttackersToCalls);
+
     if (sq < 0 || sq >= 64) {
         return 0;
     }
@@ -875,30 +916,61 @@ std::vector<Move> MoveGenerator::generateLegalMoves(board& Board) {
 }
 
 void MoveGenerator::generatePseudoLegalMoves(board& Board, MoveList& moves) {
+    PROFILE_INC(::Profiler::PseudoMovegenCalls);
+    PROFILE_TIMER(::Profiler::PseudoMovegenTime);
+
     generateMoves(Board, moves, false);
+    PROFILE_ADD(::Profiler::GeneratedPseudoMovesTotal, moves.count);
 }
 
 void MoveGenerator::generateLegalMoves(board& Board, MoveList& moves) {
+    PROFILE_INC(::Profiler::LegalMovegenCalls);
+    PROFILE_TIMER(::Profiler::LegalMovegenTime);
+#ifdef ENABLE_ENGINE_PROFILING
+    profileLegalMovegenContext();
+#endif
+
     generateMoves(Board, moves, true);
+    PROFILE_ADD(::Profiler::GeneratedLegalMovesTotal, moves.count);
 }
 
 void MoveGenerator::generateQuiescenceMoves(board& Board, MoveList& moves) {
+    PROFILE_INC(::Profiler::QMovegenCalls);
+    PROFILE_TIMER(::Profiler::QMovegenTime);
+#ifdef ENABLE_ENGINE_PROFILING
+    profileQMovegenContext();
+#endif
+
     generateQuiescenceMoveList(Board, moves);
+    PROFILE_ADD(::Profiler::GeneratedQMovesTotal, moves.count);
 }
 
 int MoveGenerator::countLegalMoves(board& Board) {
-    return countMoves(Board, true);
+    PROFILE_INC(::Profiler::CountLegalMoveCalls);
+    PROFILE_TIMER(::Profiler::CountLegalMoveTime);
+
+    int count = countMoves(Board, true);
+    return count;
 }
 
 bool MoveGenerator::isSquareAttacked(const board& Board, int sq, bool byWhite) {
+    PROFILE_INC(::Profiler::IsSquareAttackedCalls);
+    PROFILE_TIMER(::Profiler::IsSquareAttackedTime);
+
     return attackersTo(Board, sq, byWhite, Board.occupied) != 0;
 }
 
 int MoveGenerator::findKing(const board& Board, bool white) {
+    PROFILE_INC(::Profiler::FindKingCalls);
+    PROFILE_TIMER(::Profiler::FindKingTime);
+
     return Board.kingSquare(white);
 }
 
 bool MoveGenerator::isKinginCheck(const board& Board, bool white) {
+    PROFILE_INC(::Profiler::InCheckCalls);
+    PROFILE_TIMER(::Profiler::InCheckTime);
+
     int KingSquare = findKing(Board, white);
     // A king is in check when the opponent attacks its square.
     return KingSquare != -1 && isSquareAttacked(Board, KingSquare, !white);
