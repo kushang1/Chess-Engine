@@ -83,20 +83,44 @@ constexpr int BenchProfileDepth = 4;
 
 constexpr BenchProfilePosition BenchProfilePositions[] = {
     {
-        "startpos",
+        "opening",
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     },
     {
-        "kiwipete",
+        "tactical-middlegame",
         "r3k2r/p1ppqpb1/bn2pnp1/2pP4/1p2P3/2N2N2/PPPB1PPP/R2QKB1R w KQkq - 0 1"
     },
     {
-        "middlegame",
-        "rnbq1rk1/ppp2ppp/3bpn2/3p4/3P4/2NBPN2/PPP2PPP/R1BQ1RK1 w - - 0 7"
+        "closed-middlegame",
+        "r1bq1rk1/pp2nppp/2np4/2p1p3/2P1P3/2NP1NP1/PP1B1PBP/R2Q1RK1 w - - 0 10"
     },
     {
         "rook-endgame",
         "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"
+    },
+    {
+        "queen-endgame",
+        "6k1/5ppp/8/8/8/5QP1/5P1P/q5K1 w - - 0 1"
+    },
+    {
+        "pawn-endgame",
+        "8/4k3/3p4/2pPp3/2P1P3/4K3/8/8 w - - 0 1"
+    },
+    {
+        "king-attack",
+        "r3r1k1/ppp2ppp/2n2q2/3p4/3P1B2/2P1P1Q1/PP3PPP/R3R1K1 w - - 0 18"
+    },
+    {
+        "opposite-castling",
+        "2kr3r/ppp2ppp/2npbn2/3Np3/2B1P3/2PP1Q2/PPP2PPP/R3K2R w KQ - 0 12"
+    },
+    {
+        "passed-race",
+        "8/2P5/3k4/8/8/4K3/5p2/8 w - - 0 1"
+    },
+    {
+        "minor-endgame",
+        "8/5k2/3b4/3P4/2B1P3/5K2/8/8 w - - 0 1"
     }
 };
 
@@ -171,6 +195,9 @@ void UciLoop::handleCommand(const std::string& line)
     }
     else if (command == "benchprofile") {
         handleBenchProfile();
+    }
+    else if (command == "evalbench") {
+        handleEvalBench(tokens);
     }
     else if (command == "stop") {
         stopSearch();
@@ -392,6 +419,90 @@ void UciLoop::handleBenchProfile()
 
     writeLine(Profiler::report());
     setUciInfoOutput(true);
+}
+
+void UciLoop::handleEvalBench(const std::vector<std::string>& tokens)
+{
+    stopSearch();
+
+    int iterations = 2000;
+    if (tokens.size() >= 2) {
+        iterations = std::clamp(parseInt(tokens[1], iterations), 1, 1000000);
+    }
+
+    if (Profiler::isCompiledIn()) {
+        Profiler::reset();
+    }
+
+    chess::ChessEngine benchEngine;
+    writeLine("evalbench iterations " + std::to_string(iterations));
+    writeLine("index label oldEval newEval delta oldAvgNs newAvgNs newPctOfOld");
+
+    for (int i = 0; i < static_cast<int>(std::size(BenchProfilePositions)); ++i) {
+        const BenchProfilePosition& position = BenchProfilePositions[i];
+        if (!benchEngine.setPositionFromFen(position.fen)) {
+            writeLine(std::to_string(i + 1) + " " + position.label + " invalid-fen");
+            continue;
+        }
+
+        const int oldEval = benchEngine.legacyEvaluate();
+        const int newEval = benchEngine.evaluate();
+
+        volatile int oldSink = 0;
+        auto oldStart = std::chrono::steady_clock::now();
+        for (int n = 0; n < iterations; ++n) {
+            oldSink += benchEngine.legacyEvaluate();
+        }
+        auto oldEnd = std::chrono::steady_clock::now();
+
+        volatile int newSink = 0;
+        auto newStart = std::chrono::steady_clock::now();
+        for (int n = 0; n < iterations; ++n) {
+            newSink += benchEngine.evaluate();
+        }
+        auto newEnd = std::chrono::steady_clock::now();
+        (void)oldSink;
+        (void)newSink;
+
+        const long long oldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            oldEnd - oldStart).count();
+        const long long newNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            newEnd - newStart).count();
+        const long long oldAvg = oldNs / iterations;
+        const long long newAvg = newNs / iterations;
+        const long long pct = oldAvg > 0 ? (newAvg * 100LL) / oldAvg : 0;
+
+        std::string line;
+        line.reserve(180);
+        line += std::to_string(i + 1);
+        line += " ";
+        line += position.label;
+        line += " oldEval ";
+        line += std::to_string(oldEval);
+        line += " newEval ";
+        line += std::to_string(newEval);
+        line += " delta ";
+        line += std::to_string(newEval - oldEval);
+        line += " oldAvgNs ";
+        line += std::to_string(oldAvg);
+        line += " newAvgNs ";
+        line += std::to_string(newAvg);
+        line += " newPctOfOld ";
+        line += std::to_string(pct);
+        writeLine(line);
+
+        std::istringstream breakdown(benchEngine.evaluationBreakdown());
+        std::string detail;
+        while (std::getline(breakdown, detail)) {
+            if (!detail.empty()) {
+                writeLine(std::string("breakdown ") + position.label + " " + detail);
+            }
+        }
+    }
+
+    if (Profiler::isCompiledIn()) {
+        writeLine(Profiler::report());
+    }
 }
 
 UciLoop::GoCommand UciLoop::parseGo(const std::vector<std::string>& tokens) const

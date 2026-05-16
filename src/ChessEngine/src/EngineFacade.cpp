@@ -307,6 +307,23 @@ void ChessEngine::stopSearch()
     impl->searcher.requestStop();
 }
 
+int ChessEngine::evaluate() const
+{
+    board copy = impl->position;
+    return impl->searcher.debugEvaluate(copy);
+}
+
+int ChessEngine::legacyEvaluate() const
+{
+    return impl->searcher.debugEvaluateLegacy(impl->position);
+}
+
+std::string ChessEngine::evaluationBreakdown() const
+{
+    board copy = impl->position;
+    return impl->searcher.debugEvaluateBreakdown(copy);
+}
+
 PerftResult ChessEngine::perft(int depth)
 {
     PROFILE_INC(::Profiler::PerftCalls);

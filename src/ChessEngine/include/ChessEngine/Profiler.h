@@ -113,6 +113,7 @@ enum CounterId : int {
     EvalPawnStructureTime,
     EvalKingSafetyTime,
     EvalPassedPawnTime,
+    EvalAttackGenerationTime,
     ScoreMoveCalls,
     TTMoveScoreHits,
     PromotionScored,

@@ -6,6 +6,7 @@
 #include "MoveGenerator.h"
 #include "ZobristHashing.h"
 #include <atomic>
+#include <string>
 #include <thread>
 #include <vector>
 #include "Syzygy.h"
@@ -31,6 +32,9 @@ public:
     void setHashSizeMb(int megabytes);
     void clearStop();
     void requestStop();
+    int debugEvaluate(board& b);
+    int debugEvaluateLegacy(const board& b) const;
+    std::string debugEvaluateBreakdown(board& b);
 private:
     int evaluate(board &b);
     static const int MAX_DEPTH = 64;

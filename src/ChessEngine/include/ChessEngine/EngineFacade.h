@@ -37,6 +37,9 @@ public:
     void setHashSizeMb(int megabytes);
     void clearSearchStop();
     void stopSearch();
+    int evaluate() const;
+    int legacyEvaluate() const;
+    std::string evaluationBreakdown() const;
 
     PerftResult perft(int depth);
     std::vector<PerftDivideEntry> divide(int depth);

@@ -5,6 +5,7 @@
 #include "Profiler.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <iomanip>
 #include <new>
 #include <random>
+#include <sstream>
 #include <string>
 
 #ifdef _WIN32
@@ -924,6 +926,859 @@ static const int kingPST[64] =
   -30,-40,-40,-50,-50,-40,-40,-30
 };
 
+namespace {
+
+constexpr int EvalMaxPhase = 24;
+
+struct EvalScore {
+	int mg = 0;
+	int eg = 0;
+};
+
+inline EvalScore& operator+=(EvalScore& lhs, const EvalScore& rhs)
+{
+	lhs.mg += rhs.mg;
+	lhs.eg += rhs.eg;
+	return lhs;
+}
+
+inline EvalScore operator-(const EvalScore& score)
+{
+	return { -score.mg, -score.eg };
+}
+
+struct EvalBreakdown {
+	EvalScore materialPst;
+	EvalScore pawns;
+	EvalScore mobility;
+	EvalScore rooks;
+	EvalScore bishopPair;
+	EvalScore kingSafety;
+	EvalScore kingActivity;
+	EvalScore total;
+	int phase = 0;
+	int whiteAttackUnits = 0;
+	int blackAttackUnits = 0;
+	int whiteKingZoneHits = 0;
+	int blackKingZoneHits = 0;
+	int finalWhiteScore = 0;
+	int finalSideScore = 0;
+};
+
+struct AttackEval {
+	EvalScore mobility;
+	EvalScore rooks;
+	int whiteAttackUnits = 0;
+	int blackAttackUnits = 0;
+	int whiteKingZoneHits = 0;
+	int blackKingZoneHits = 0;
+};
+
+struct EvalContext {
+	const board& b;
+	Bitboard occ = 0;
+	Bitboard whiteOcc = 0;
+	Bitboard blackOcc = 0;
+	Bitboard whitePawns = 0;
+	Bitboard blackPawns = 0;
+	uint8_t whitePawnFiles = 0;
+	uint8_t blackPawnFiles = 0;
+	int whiteKing = -1;
+	int blackKing = -1;
+	Bitboard whiteKingZone = 0;
+	Bitboard blackKingZone = 0;
+	int phase = 0;
+};
+
+constexpr Bitboard bitConst(int sq)
+{
+	return 1ULL << sq;
+}
+
+constexpr Bitboard makeFileMaskConst(int file)
+{
+	Bitboard mask = 0;
+	for (int row = 0; row < 8; ++row) {
+		mask |= bitConst((row << 3) | file);
+	}
+	return mask;
+}
+
+constexpr std::array<Bitboard, 8> makeFileMasks()
+{
+	std::array<Bitboard, 8> masks{};
+	for (int file = 0; file < 8; ++file) {
+		masks[file] = makeFileMaskConst(file);
+	}
+	return masks;
+}
+
+constexpr std::array<Bitboard, 8> makeAdjacentFileMasks()
+{
+	std::array<Bitboard, 8> masks{};
+	for (int file = 0; file < 8; ++file) {
+		if (file > 0) {
+			masks[file] |= makeFileMaskConst(file - 1);
+		}
+		if (file < 7) {
+			masks[file] |= makeFileMaskConst(file + 1);
+		}
+	}
+	return masks;
+}
+
+constexpr std::array<Bitboard, 8> makeRankMasks()
+{
+	std::array<Bitboard, 8> masks{};
+	for (int row = 0; row < 8; ++row) {
+		masks[row] = 0xFFULL << (row * 8);
+	}
+	return masks;
+}
+
+constexpr std::array<uint8_t, 8> makeKingFileBits()
+{
+	std::array<uint8_t, 8> bits{};
+	for (int file = 0; file < 8; ++file) {
+		uint8_t mask = static_cast<uint8_t>(1u << file);
+		if (file > 0) {
+			mask |= static_cast<uint8_t>(1u << (file - 1));
+		}
+		if (file < 7) {
+			mask |= static_cast<uint8_t>(1u << (file + 1));
+		}
+		bits[file] = mask;
+	}
+	return bits;
+}
+
+constexpr std::array<std::array<Bitboard, 64>, 2> makeKingZoneMasks()
+{
+	std::array<std::array<Bitboard, 64>, 2> masks{};
+	for (int color = 0; color < 2; ++color) {
+		const int forward = color == Bitboards::WHITE ? -1 : 1;
+		for (int sq = 0; sq < 64; ++sq) {
+			const int row = sq >> 3;
+			const int file = sq & 7;
+			Bitboard zone = bitConst(sq);
+			for (int dr = -1; dr <= 1; ++dr) {
+				for (int df = -1; df <= 1; ++df) {
+					const int nr = row + dr;
+					const int nf = file + df;
+					if (nr >= 0 && nr < 8 && nf >= 0 && nf < 8) {
+						zone |= bitConst((nr << 3) | nf);
+					}
+				}
+			}
+			for (int df = -1; df <= 1; ++df) {
+				const int nr = row + 2 * forward;
+				const int nf = file + df;
+				if (nr >= 0 && nr < 8 && nf >= 0 && nf < 8) {
+					zone |= bitConst((nr << 3) | nf);
+				}
+			}
+			masks[color][sq] = zone;
+		}
+	}
+	return masks;
+}
+
+constexpr std::array<std::array<Bitboard, 64>, 2> makePawnShieldMasks()
+{
+	std::array<std::array<Bitboard, 64>, 2> masks{};
+	for (int color = 0; color < 2; ++color) {
+		const int forward = color == Bitboards::WHITE ? -1 : 1;
+		for (int sq = 0; sq < 64; ++sq) {
+			const int row = sq >> 3;
+			const int file = sq & 7;
+			const int nr = row + forward;
+			Bitboard shield = 0;
+			if (nr >= 0 && nr < 8) {
+				for (int df = -1; df <= 1; ++df) {
+					const int nf = file + df;
+					if (nf >= 0 && nf < 8) {
+						shield |= bitConst((nr << 3) | nf);
+					}
+				}
+			}
+			masks[color][sq] = shield;
+		}
+	}
+	return masks;
+}
+
+constexpr std::array<std::array<Bitboard, 64>, 2> makePawnShieldCenterMasks()
+{
+	std::array<std::array<Bitboard, 64>, 2> masks{};
+	for (int color = 0; color < 2; ++color) {
+		const int forward = color == Bitboards::WHITE ? -1 : 1;
+		for (int sq = 0; sq < 64; ++sq) {
+			const int row = sq >> 3;
+			const int file = sq & 7;
+			const int nr = row + forward;
+			masks[color][sq] = (nr >= 0 && nr < 8) ? bitConst((nr << 3) | file) : 0;
+		}
+	}
+	return masks;
+}
+
+constexpr std::array<Bitboard, 8> FileMasks = makeFileMasks();
+constexpr std::array<Bitboard, 8> AdjacentFileMasks = makeAdjacentFileMasks();
+constexpr std::array<Bitboard, 8> RankMasks = makeRankMasks();
+constexpr std::array<uint8_t, 8> KingFileBits = makeKingFileBits();
+constexpr std::array<std::array<Bitboard, 64>, 2> KingZoneMasks = makeKingZoneMasks();
+constexpr std::array<std::array<Bitboard, 64>, 2> PawnShieldMasks = makePawnShieldMasks();
+constexpr std::array<std::array<Bitboard, 64>, 2> PawnShieldCenterMasks = makePawnShieldCenterMasks();
+
+static const int kingEgPST[64] = {
+	-50,-35,-25,-20,-20,-25,-35,-50,
+	-35,-20,-10, -5, -5,-10,-20,-35,
+	-25,-10,  5, 12, 12,  5,-10,-25,
+	-20, -5, 12, 25, 25, 12, -5,-20,
+	-20, -5, 12, 25, 25, 12, -5,-20,
+	-25,-10,  5, 12, 12,  5,-10,-25,
+	-35,-20,-10, -5, -5,-10,-20,-35,
+	-50,-35,-25,-20,-20,-25,-35,-50
+};
+
+static const EvalScore passedPawnBonus[8] = {
+	{ 0, 0 }, { 8, 18 }, { 14, 28 }, { 24, 48 },
+	{ 40, 78 }, { 65, 125 }, { 105, 210 }, { 0, 0 }
+};
+
+static inline int blendScore(const EvalScore& score, int phase)
+{
+	return (score.mg * phase + score.eg * (EvalMaxPhase - phase)) / EvalMaxPhase;
+}
+
+static inline int relativeSquare(bool white, int sq)
+{
+	return white ? (sq ^ 56) : sq;
+}
+
+static inline int popcountFiles(uint8_t files)
+{
+	return Bitboards::popcount(static_cast<Bitboard>(files));
+}
+
+static inline uint8_t pawnFilesMask(Bitboard pawns)
+{
+	uint8_t files = 0;
+	for (int file = 0; file < 8; ++file) {
+		if ((pawns & FileMasks[file]) != 0) {
+			files |= static_cast<uint8_t>(1u << file);
+		}
+	}
+	return files;
+}
+
+static inline Bitboard eastOne(Bitboard bb)
+{
+	return (bb & ~FileMasks[7]) << 1;
+}
+
+static inline Bitboard westOne(Bitboard bb)
+{
+	return (bb & ~FileMasks[0]) >> 1;
+}
+
+static inline Bitboard northFillExclusive(Bitboard bb)
+{
+	bb |= bb >> 8;
+	bb |= bb >> 16;
+	bb |= bb >> 32;
+	return bb >> 8;
+}
+
+static inline Bitboard southFillExclusive(Bitboard bb)
+{
+	bb |= bb << 8;
+	bb |= bb << 16;
+	bb |= bb << 32;
+	return bb << 8;
+}
+
+static inline Bitboard whitePawnAttackMap(Bitboard pawns)
+{
+	return ((pawns & ~FileMasks[0]) >> 9) | ((pawns & ~FileMasks[7]) >> 7);
+}
+
+static inline Bitboard blackPawnAttackMap(Bitboard pawns)
+{
+	return ((pawns & ~FileMasks[0]) << 7) | ((pawns & ~FileMasks[7]) << 9);
+}
+
+static inline EvalScore materialForPiece(Piece p)
+{
+	switch (p) {
+	case WP: case BP: return { 82, 94 };
+	case WN: case BN: return { 337, 281 };
+	case WB: case BB: return { 365, 297 };
+	case WR: case BR: return { 477, 512 };
+	case WQ: case BQ: return { 1025, 936 };
+	default: return { 0, 0 };
+	}
+}
+
+static inline EvalScore pstForPiece(Piece p, int sq)
+{
+	const bool white = isWhitePieceFast(p);
+	const int psq = relativeSquare(white, sq);
+	switch (p) {
+	case WP: case BP: return { pawnPST[psq], pawnPST[psq] / 2 };
+	case WN: case BN: return { knightPST[psq], knightPST[psq] / 2 };
+	case WB: case BB: return { bishopPST[psq], bishopPST[psq] / 2 };
+	case WR: case BR: return { rookPST[psq], rookPST[psq] / 3 };
+	case WQ: case BQ: return { queenPST[psq], queenPST[psq] / 3 };
+	case WK: case BK: return { kingPST[psq], 0 };
+	default: return { 0, 0 };
+	}
+}
+
+static std::array<std::array<EvalScore, 64>, 13> makePieceSquareScores()
+{
+	std::array<std::array<EvalScore, 64>, 13> scores{};
+	constexpr Piece pieces[] = { WP, WN, WB, WR, WQ, WK, BP, BN, BB, BR, BQ, BK };
+	for (Piece p : pieces) {
+		const bool white = isWhitePieceFast(p);
+		for (int sq = 0; sq < 64; ++sq) {
+			EvalScore term = materialForPiece(p);
+			term += pstForPiece(p, sq);
+			scores[p][sq] = white ? term : -term;
+		}
+	}
+	return scores;
+}
+
+static const std::array<std::array<EvalScore, 64>, 13> PieceSquareScores = makePieceSquareScores();
+
+static inline int computePhase(const board& b)
+{
+	int phase = 0;
+	phase += b.countPieces(WN) + b.countPieces(BN);
+	phase += b.countPieces(WB) + b.countPieces(BB);
+	phase += 2 * (b.countPieces(WR) + b.countPieces(BR));
+	phase += 4 * (b.countPieces(WQ) + b.countPieces(BQ));
+	return std::min(phase, EvalMaxPhase);
+}
+
+static EvalContext makeEvalContext(const board& b)
+{
+	EvalContext ctx{ b };
+	ctx.occ = b.occupied;
+	ctx.whiteOcc = b.whiteOcc;
+	ctx.blackOcc = b.blackOcc;
+	ctx.whitePawns = b.pieces(WP);
+	ctx.blackPawns = b.pieces(BP);
+	ctx.whitePawnFiles = pawnFilesMask(ctx.whitePawns);
+	ctx.blackPawnFiles = pawnFilesMask(ctx.blackPawns);
+	ctx.whiteKing = b.kingSquare(true);
+	ctx.blackKing = b.kingSquare(false);
+	ctx.whiteKingZone = ctx.whiteKing >= 0 ? KingZoneMasks[Bitboards::WHITE][ctx.whiteKing] : 0;
+	ctx.blackKingZone = ctx.blackKing >= 0 ? KingZoneMasks[Bitboards::BLACK][ctx.blackKing] : 0;
+	ctx.phase = computePhase(b);
+	return ctx;
+}
+
+static EvalScore evaluateMaterialPst(const EvalContext& ctx)
+{
+	PROFILE_TIMER(::Profiler::EvalMaterialPstTime);
+	constexpr Piece pieces[] = { WP, WN, WB, WR, WQ, WK, BP, BN, BB, BR, BQ, BK };
+	EvalScore score;
+	for (Piece p : pieces) {
+		Bitboard bb = ctx.b.pieces(p);
+		while (bb != 0) {
+			const int sq = Bitboards::poplsb(bb);
+			score += PieceSquareScores[p][sq];
+		}
+	}
+	return score;
+}
+
+static EvalScore evaluatePawns(const EvalContext& ctx)
+{
+	PROFILE_TIMER(::Profiler::EvalPawnStructureTime);
+	EvalScore score;
+	Bitboard whitePassed = 0;
+	Bitboard blackPassed = 0;
+	Bitboard whiteConnectedPassed = 0;
+	Bitboard blackConnectedPassed = 0;
+
+	{
+		PROFILE_TIMER(::Profiler::EvalPassedPawnTime);
+		const Bitboard blackStops = southFillExclusive(ctx.blackPawns);
+		const Bitboard whiteStops = northFillExclusive(ctx.whitePawns);
+		const Bitboard whiteBlocked = blackStops | eastOne(blackStops) | westOne(blackStops);
+		const Bitboard blackBlocked = whiteStops | eastOne(whiteStops) | westOne(whiteStops);
+		whitePassed = ctx.whitePawns & ~whiteBlocked;
+		blackPassed = ctx.blackPawns & ~blackBlocked;
+
+		const Bitboard whiteConnected =
+			whitePawnAttackMap(ctx.whitePawns) | eastOne(ctx.whitePawns) | westOne(ctx.whitePawns);
+		const Bitboard blackConnected =
+			blackPawnAttackMap(ctx.blackPawns) | eastOne(ctx.blackPawns) | westOne(ctx.blackPawns);
+		whiteConnectedPassed = whitePassed & whiteConnected;
+		blackConnectedPassed = blackPassed & blackConnected;
+
+		for (int row = 0; row < 8; ++row) {
+			const int whiteAdvanced = 7 - row;
+			const int blackAdvanced = row;
+			const int whiteCount = Bitboards::popcount(whitePassed & RankMasks[row]);
+			const int blackCount = Bitboards::popcount(blackPassed & RankMasks[row]);
+			score.mg += whiteCount * passedPawnBonus[whiteAdvanced].mg;
+			score.eg += whiteCount * passedPawnBonus[whiteAdvanced].eg;
+			score.mg -= blackCount * passedPawnBonus[blackAdvanced].mg;
+			score.eg -= blackCount * passedPawnBonus[blackAdvanced].eg;
+
+			const int whiteConnectedCount = Bitboards::popcount(whiteConnectedPassed & RankMasks[row]);
+			const int blackConnectedCount = Bitboards::popcount(blackConnectedPassed & RankMasks[row]);
+			score.mg += whiteConnectedCount * (10 + 2 * whiteAdvanced);
+			score.eg += whiteConnectedCount * (22 + 5 * whiteAdvanced);
+			score.mg -= blackConnectedCount * (10 + 2 * blackAdvanced);
+			score.eg -= blackConnectedCount * (22 + 5 * blackAdvanced);
+		}
+	}
+
+	for (int file = 0; file < 8; ++file) {
+		const int whiteCount = Bitboards::popcount(ctx.whitePawns & FileMasks[file]);
+		const int blackCount = Bitboards::popcount(ctx.blackPawns & FileMasks[file]);
+
+		if (whiteCount > 1) {
+			score.mg -= 8 * (whiteCount - 1);
+			score.eg -= 12 * (whiteCount - 1);
+		}
+		if (blackCount > 1) {
+			score.mg += 8 * (blackCount - 1);
+			score.eg += 12 * (blackCount - 1);
+		}
+
+		if (whiteCount != 0 && (ctx.whitePawns & AdjacentFileMasks[file]) == 0) {
+			score.mg -= 10 * whiteCount;
+			score.eg -= 14 * whiteCount;
+		}
+		if (blackCount != 0 && (ctx.blackPawns & AdjacentFileMasks[file]) == 0) {
+			score.mg += 10 * blackCount;
+			score.eg += 14 * blackCount;
+		}
+	}
+
+	return score;
+}
+
+static inline EvalScore knightMobilityScore(int count)
+{
+	return { -24 + 8 * count, -16 + 5 * count };
+}
+
+static inline EvalScore bishopMobilityScore(int count)
+{
+	return { -18 + 5 * count, -12 + 4 * count };
+}
+
+static inline EvalScore rookMobilityScore(int count)
+{
+	return { -10 + 3 * count, -8 + 4 * count };
+}
+
+static inline EvalScore queenMobilityScore(int count)
+{
+	return { -4 + count, -2 + count };
+}
+
+static inline EvalScore rookFeatureScore(const EvalContext& ctx, bool white, int sq)
+{
+	const Bitboard ownPawns = white ? ctx.whitePawns : ctx.blackPawns;
+	const Bitboard enemyPawns = white ? ctx.blackPawns : ctx.whitePawns;
+	const int file = sq & 7;
+	const int row = sq >> 3;
+	const Bitboard fileMask = FileMasks[file];
+	EvalScore score;
+	if ((ownPawns & fileMask) == 0) {
+		if ((enemyPawns & fileMask) == 0) {
+			score.mg += 22;
+			score.eg += 14;
+		}
+		else {
+			score.mg += 12;
+			score.eg += 8;
+		}
+	}
+	if ((white && row == 1) || (!white && row == 6)) {
+		score.mg += 18;
+		score.eg += 28;
+	}
+	return score;
+}
+
+static inline void addKingPressure(AttackEval& eval, bool attackerWhite,
+	Bitboard attacks, Bitboard kingZone, int weight)
+{
+	const int hits = Bitboards::popcount(attacks & kingZone);
+	if (attackerWhite) {
+		eval.whiteAttackUnits += hits * weight;
+		eval.blackKingZoneHits += hits;
+	}
+	else {
+		eval.blackAttackUnits += hits * weight;
+		eval.whiteKingZoneHits += hits;
+	}
+}
+
+static AttackEval evaluateMobilityAndKingPressure(const EvalContext& ctx)
+{
+	PROFILE_TIMER(::Profiler::EvalMobilityActivityTime);
+	PROFILE_TIMER(::Profiler::EvalAttackGenerationTime);
+	AttackEval eval;
+
+	auto addMobility = [](EvalScore& total, bool white, EvalScore term) {
+		total += white ? term : -term;
+		};
+
+	Bitboard bb = ctx.b.pieces(WN);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::KnightAttacks[sq];
+		addMobility(eval.mobility, true, knightMobilityScore(Bitboards::popcount(attacks & ~ctx.whiteOcc)));
+		addKingPressure(eval, true, attacks, ctx.blackKingZone, 4);
+	}
+
+	bb = ctx.b.pieces(BN);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::KnightAttacks[sq];
+		addMobility(eval.mobility, false, knightMobilityScore(Bitboards::popcount(attacks & ~ctx.blackOcc)));
+		addKingPressure(eval, false, attacks, ctx.whiteKingZone, 4);
+	}
+
+	bb = ctx.b.pieces(WB);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::bishopAttacks(sq, ctx.occ);
+		addMobility(eval.mobility, true, bishopMobilityScore(Bitboards::popcount(attacks & ~ctx.whiteOcc)));
+		addKingPressure(eval, true, attacks, ctx.blackKingZone, 3);
+	}
+
+	bb = ctx.b.pieces(BB);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::bishopAttacks(sq, ctx.occ);
+		addMobility(eval.mobility, false, bishopMobilityScore(Bitboards::popcount(attacks & ~ctx.blackOcc)));
+		addKingPressure(eval, false, attacks, ctx.whiteKingZone, 3);
+	}
+
+	bb = ctx.b.pieces(WR);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::rookAttacks(sq, ctx.occ);
+		addMobility(eval.mobility, true, rookMobilityScore(Bitboards::popcount(attacks & ~ctx.whiteOcc)));
+		eval.rooks += rookFeatureScore(ctx, true, sq);
+		addKingPressure(eval, true, attacks, ctx.blackKingZone, 5);
+	}
+
+	bb = ctx.b.pieces(BR);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::rookAttacks(sq, ctx.occ);
+		addMobility(eval.mobility, false, rookMobilityScore(Bitboards::popcount(attacks & ~ctx.blackOcc)));
+		eval.rooks += -rookFeatureScore(ctx, false, sq);
+		addKingPressure(eval, false, attacks, ctx.whiteKingZone, 5);
+	}
+
+	bb = ctx.b.pieces(WQ);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::queenAttacks(sq, ctx.occ);
+		addMobility(eval.mobility, true, queenMobilityScore(Bitboards::popcount(attacks & ~ctx.whiteOcc)));
+		addKingPressure(eval, true, attacks, ctx.blackKingZone, 7);
+	}
+
+	bb = ctx.b.pieces(BQ);
+	while (bb != 0) {
+		const int sq = Bitboards::poplsb(bb);
+		const Bitboard attacks = Bitboards::queenAttacks(sq, ctx.occ);
+		addMobility(eval.mobility, false, queenMobilityScore(Bitboards::popcount(attacks & ~ctx.blackOcc)));
+		addKingPressure(eval, false, attacks, ctx.whiteKingZone, 7);
+	}
+
+	return eval;
+}
+
+static EvalScore evaluateBishopPair(const EvalContext& ctx)
+{
+	EvalScore score;
+	if (ctx.b.countPieces(WB) >= 2) {
+		score.mg += 30;
+		score.eg += 45;
+	}
+	if (ctx.b.countPieces(BB) >= 2) {
+		score.mg -= 30;
+		score.eg -= 45;
+	}
+	return score;
+}
+
+static inline int kingDangerScore(int units)
+{
+	const int capped = std::min(units, 96);
+	return std::min(320, (capped * capped) / 24);
+}
+
+static inline int kingShieldScore(Bitboard pawns, int color, int kingSq)
+{
+	if (kingSq < 0) {
+		return 0;
+	}
+	const Bitboard shield = PawnShieldMasks[color][kingSq] & pawns;
+	const Bitboard center = PawnShieldCenterMasks[color][kingSq] & pawns;
+	return 8 * Bitboards::popcount(shield) + 6 * Bitboards::popcount(center);
+}
+
+static inline int kingFilePenalty(uint8_t ownPawnFiles, uint8_t enemyPawnFiles, int kingSq)
+{
+	if (kingSq < 0) {
+		return 0;
+	}
+	const uint8_t nearFiles = KingFileBits[kingSq & 7];
+	const uint8_t allPawnFiles = static_cast<uint8_t>(ownPawnFiles | enemyPawnFiles);
+	const int semiOpen = popcountFiles(static_cast<uint8_t>(nearFiles & ~ownPawnFiles));
+	const int open = popcountFiles(static_cast<uint8_t>(nearFiles & ~allPawnFiles));
+	return 7 * semiOpen + 9 * open;
+}
+
+static EvalScore evaluateKingSafety(const EvalContext& ctx, const AttackEval& attacks)
+{
+	PROFILE_TIMER(::Profiler::EvalKingSafetyTime);
+	EvalScore score;
+	const int whiteDanger = kingDangerScore(attacks.blackAttackUnits);
+	const int blackDanger = kingDangerScore(attacks.whiteAttackUnits);
+	score.mg += blackDanger - whiteDanger;
+
+	score.mg += kingShieldScore(ctx.whitePawns, Bitboards::WHITE, ctx.whiteKing);
+	score.mg -= kingShieldScore(ctx.blackPawns, Bitboards::BLACK, ctx.blackKing);
+	score.mg -= kingFilePenalty(ctx.whitePawnFiles, ctx.blackPawnFiles, ctx.whiteKing);
+	score.mg += kingFilePenalty(ctx.blackPawnFiles, ctx.whitePawnFiles, ctx.blackKing);
+	return score;
+}
+
+static EvalScore evaluateKingActivity(const EvalContext& ctx)
+{
+	EvalScore score;
+	if (ctx.whiteKing >= 0) {
+		score.eg += kingEgPST[relativeSquare(true, ctx.whiteKing)];
+		score.eg += 10 * Bitboards::popcount(Bitboards::KingAttacks[ctx.whiteKing] & ctx.blackPawns);
+	}
+	if (ctx.blackKing >= 0) {
+		score.eg -= kingEgPST[relativeSquare(false, ctx.blackKing)];
+		score.eg -= 10 * Bitboards::popcount(Bitboards::KingAttacks[ctx.blackKing] & ctx.whitePawns);
+	}
+	return score;
+}
+
+static int evaluateClassical(board& b, EvalBreakdown* breakdown)
+{
+	const EvalContext ctx = makeEvalContext(b);
+	EvalScore total;
+
+	EvalScore term = evaluateMaterialPst(ctx);
+	total += term;
+	if (breakdown) breakdown->materialPst = term;
+
+	term = evaluatePawns(ctx);
+	total += term;
+	if (breakdown) breakdown->pawns = term;
+
+	const AttackEval attacks = evaluateMobilityAndKingPressure(ctx);
+	total += attacks.mobility;
+	if (breakdown) {
+		breakdown->mobility = attacks.mobility;
+		breakdown->whiteAttackUnits = attacks.whiteAttackUnits;
+		breakdown->blackAttackUnits = attacks.blackAttackUnits;
+		breakdown->whiteKingZoneHits = attacks.whiteKingZoneHits;
+		breakdown->blackKingZoneHits = attacks.blackKingZoneHits;
+	}
+
+	term = attacks.rooks;
+	total += term;
+	if (breakdown) breakdown->rooks = term;
+
+	term = evaluateBishopPair(ctx);
+	total += term;
+	if (breakdown) breakdown->bishopPair = term;
+
+	term = evaluateKingSafety(ctx, attacks);
+	total += term;
+	if (breakdown) breakdown->kingSafety = term;
+
+	term = evaluateKingActivity(ctx);
+	total += term;
+	if (breakdown) breakdown->kingActivity = term;
+
+	const int whiteScore = blendScore(total, ctx.phase);
+	const int sideScore = b.isWhiteTurn ? whiteScore : -whiteScore;
+	if (breakdown) {
+		breakdown->total = total;
+		breakdown->phase = ctx.phase;
+		breakdown->finalWhiteScore = whiteScore;
+		breakdown->finalSideScore = sideScore;
+	}
+	return sideScore;
+}
+
+static int evaluateLegacyPosition(const board& b)
+{
+	int score = 0;
+
+	static const int matVal[13] = {
+		  0,
+	   -900, -500, -100, -300, -20000, -320,
+		900,  500,  100,  300,  20000,  320
+	};
+
+	auto pst = [&](Piece p, int sq)
+		{
+			switch (p)
+			{
+			case WP: return  pawnPST[sq ^ 56];
+			case BP: return -pawnPST[sq];
+			case WN: return  knightPST[sq ^ 56];
+			case BN: return -knightPST[sq];
+			case WB: return  bishopPST[sq ^ 56];
+			case BB: return -bishopPST[sq];
+			case WR: return  rookPST[sq ^ 56];
+			case BR: return -rookPST[sq];
+			case WQ: return  queenPST[sq ^ 56];
+			case BQ: return -queenPST[sq];
+			case WK: return  kingPST[sq ^ 56];
+			case BK: return -kingPST[sq];
+			default: return 0;
+			}
+		};
+
+	constexpr Piece legacyPieces[] = { BQ, BR, BP, BN, BK, BB, WQ, WR, WP, WN, WK, WB };
+	for (Piece p : legacyPieces)
+	{
+		int n = b.pieceCount[p];
+		const int* list = b.pieceList[p];
+		int mv = matVal[p];
+
+		for (int i = 0; i < n; i++) {
+			int sq = list[i];
+			score += mv;
+			score += pst(p, sq);
+		}
+	}
+
+	for (int i = 0; i < b.pieceCount[WN]; i++) score += knightMob[b.pieceList[WN][i]];
+	for (int i = 0; i < b.pieceCount[BN]; i++) score -= knightMob[b.pieceList[BN][i]];
+	for (int i = 0; i < b.pieceCount[WB]; i++) score += bishopMob[b.pieceList[WB][i]];
+	for (int i = 0; i < b.pieceCount[BB]; i++) score -= bishopMob[b.pieceList[BB][i]];
+	for (int i = 0; i < b.pieceCount[WR]; i++) score += rookMob[b.pieceList[WR][i]];
+	for (int i = 0; i < b.pieceCount[BR]; i++) score -= rookMob[b.pieceList[BR][i]];
+
+	auto isPassed = [&](int sq, bool white)
+		{
+			int file = sq & 7;
+			int rank = sq >> 3;
+			if (white) {
+				for (int i = 0; i < b.pieceCount[BP]; i++) {
+					int psq = b.pieceList[BP][i];
+					if (abs((psq & 7) - file) <= 1 && (psq >> 3) < rank)
+						return false;
+				}
+				return true;
+			}
+			for (int i = 0; i < b.pieceCount[WP]; i++) {
+				int psq = b.pieceList[WP][i];
+				if (abs((psq & 7) - file) <= 1 && (psq >> 3) > rank)
+					return false;
+			}
+			return true;
+		};
+
+	for (int i = 0; i < b.pieceCount[WP]; i++) {
+		int sq = b.pieceList[WP][i];
+		int advancedRanks = 7 - (sq >> 3);
+		if (isPassed(sq, true)) score += 40 + 10 * advancedRanks;
+	}
+	for (int i = 0; i < b.pieceCount[BP]; i++) {
+		int sq = b.pieceList[BP][i];
+		int advancedRanks = sq >> 3;
+		if (isPassed(sq, false)) score -= 40 + 10 * advancedRanks;
+	}
+
+	int wFileCnt[8] = { 0 }, bFileCnt[8] = { 0 };
+	for (int i = 0; i < b.pieceCount[WP]; i++) wFileCnt[b.pieceList[WP][i] & 7]++;
+	for (int i = 0; i < b.pieceCount[BP]; i++) bFileCnt[b.pieceList[BP][i] & 7]++;
+	for (int f = 0; f < 8; f++) {
+		if (wFileCnt[f] > 1) score -= 15 * (wFileCnt[f] - 1);
+		if (bFileCnt[f] > 1) score += 15 * (bFileCnt[f] - 1);
+	}
+
+	int wKing = b.kingSquare(true);
+	int bKing = b.kingSquare(false);
+	Bitboard whiteAttacks = attackMapForSide(b, true);
+	Bitboard blackAttacks = attackMapForSide(b, false);
+	int atkWhiteKing = Bitboards::popcount(kingSafetyZoneMask(wKing) & blackAttacks);
+	int atkBlackKing = Bitboards::popcount(kingSafetyZoneMask(bKing) & whiteAttacks);
+	score -= atkWhiteKing * 20;
+	score += atkBlackKing * 20;
+
+	auto pawnShield = [&](int ksq, bool isWhite) {
+		int r = ksq >> 3, c = ksq & 7;
+		int s = 0;
+		if (isWhite && r > 0) {
+			int front = r - 1;
+			if (b.pieceAt(front * 8 + c) == WP) s += 15;
+			if (c > 0 && b.pieceAt(front * 8 + c - 1) == WP) s += 10;
+			if (c < 7 && b.pieceAt(front * 8 + c + 1) == WP) s += 10;
+		}
+		else if (!isWhite && r < 7) {
+			int front = r + 1;
+			if (b.pieceAt(front * 8 + c) == BP) s += 15;
+			if (c > 0 && b.pieceAt(front * 8 + c - 1) == BP) s += 10;
+			if (c < 7 && b.pieceAt(front * 8 + c + 1) == BP) s += 10;
+		}
+		return s;
+		};
+
+	score += pawnShield(wKing, true);
+	score -= pawnShield(bKing, false);
+
+	bool wPawnFiles[8] = { false };
+	bool bPawnFiles[8] = { false };
+	for (int i = 0; i < b.pieceCount[WP]; i++) wPawnFiles[b.pieceList[WP][i] & 7] = true;
+	for (int i = 0; i < b.pieceCount[BP]; i++) bPawnFiles[b.pieceList[BP][i] & 7] = true;
+
+	auto kingOpenPenalty = [&](int ksq, bool white) {
+		int f = ksq & 7;
+		int s = 0;
+		const bool* files = white ? wPawnFiles : bPawnFiles;
+		if (!files[f]) s -= 15;
+		if (f > 0 && !files[f - 1]) s -= 10;
+		if (f < 7 && !files[f + 1]) s -= 10;
+		return s;
+		};
+
+	score += kingOpenPenalty(wKing, true);
+	score -= kingOpenPenalty(bKing, false);
+
+	if (wKing == 62 || wKing == 58) score += 40;
+	if (bKing == 6 || bKing == 2) score -= 40;
+
+	auto isCenter = [&](int sq) {
+		int r = sq >> 3, c = sq & 7;
+		return (r >= 2 && r <= 5 && c >= 2 && c <= 5);
+		};
+	if (b.fullmoveNumber > 10) {
+		if (isCenter(wKing)) score -= 40;
+		if (isCenter(bKing)) score += 40;
+	}
+
+	return b.isWhiteTurn ? score : -score;
+}
+
+} // namespace
+
 // ==========================================================
 // MOVE ORDERING (CAPTURE + KILLER + HISTORY)
 // ==========================================================
@@ -979,243 +1834,51 @@ int Engine::evaluate(board& b)
 {
 	PROFILE_INC(::Profiler::EvalCalls);
 	PROFILE_TIMER(::Profiler::EvalTime);
-
-	int score = 0;
-
-	// ----------------------------------------------------------
-	// MATERIAL VALUES
-	// ----------------------------------------------------------
-	static const int matVal[13] = {
-		  0,
-	   -900, -500, -100, -300, -20000, -320,   // black pieces
-		900,  500,  100,  300,  20000,  320    // white pieces
-	};
-
-	// ----------------------------------------------------------
-	// PIECE-SQUARE TABLE HELPER
-	// ----------------------------------------------------------
-	auto pst = [&](Piece p, int sq)
-		{
-			switch (p)
-			{
-			case WP: return  pawnPST[sq ^ 56];
-			case BP: return -pawnPST[sq];
-
-			case WN: return  knightPST[sq ^ 56];
-			case BN: return -knightPST[sq];
-
-			case WB: return  bishopPST[sq ^ 56];
-			case BB: return -bishopPST[sq];
-
-			case WR: return  rookPST[sq ^ 56];
-			case BR: return -rookPST[sq];
-
-			case WQ: return  queenPST[sq ^ 56];
-			case BQ: return -queenPST[sq];
-
-			case WK: return  kingPST[sq ^ 56];
-			case BK: return -kingPST[sq];
-			}
-			return 0;
-		};
-
-	// ----------------------------------------------------------
-	// MATERIAL + PST
-	// ----------------------------------------------------------
-	{
-		PROFILE_TIMER(::Profiler::EvalMaterialPstTime);
-		for (int p = BQ; p <= WB; ++p)
-		{
-			int n = b.pieceCount[p];
-			const int* list = b.pieceList[p];
-			int mv = matVal[p];
-
-			for (int i = 0; i < n; i++) {
-				int sq = list[i];
-				score += mv;
-				score += pst((Piece)p, sq);
-			}
-		}
-	}
-
-	// ----------------------------------------------------------
-	// MOBILITY
-	// ----------------------------------------------------------
-	{
-		PROFILE_TIMER(::Profiler::EvalMobilityActivityTime);
-		for (int i = 0; i < b.pieceCount[WN]; i++) score += knightMob[b.pieceList[WN][i]];
-		for (int i = 0; i < b.pieceCount[BN]; i++) score -= knightMob[b.pieceList[BN][i]];
-
-		for (int i = 0; i < b.pieceCount[WB]; i++) score += bishopMob[b.pieceList[WB][i]];
-		for (int i = 0; i < b.pieceCount[BB]; i++) score -= bishopMob[b.pieceList[BB][i]];
-
-		for (int i = 0; i < b.pieceCount[WR]; i++) score += rookMob[b.pieceList[WR][i]];
-		for (int i = 0; i < b.pieceCount[BR]; i++) score -= rookMob[b.pieceList[BR][i]];
-	}
-
-	// ----------------------------------------------------------
-	// PAWN STRUCTURE ? Passed pawns
-	// ----------------------------------------------------------
-	{
-		PROFILE_TIMER(::Profiler::EvalPassedPawnTime);
-		auto isPassed = [&](int sq, bool white)
-			{
-				int file = sq & 7;
-				int rank = sq >> 3;
-
-				if (white) {
-					for (int i = 0; i < b.pieceCount[BP]; i++) {
-						int psq = b.pieceList[BP][i];
-						if (abs((psq & 7) - file) <= 1 && (psq >> 3) < rank)
-							return false;
-					}
-					return true;
-				}
-				else {
-					for (int i = 0; i < b.pieceCount[WP]; i++) {
-						int psq = b.pieceList[WP][i];
-						if (abs((psq & 7) - file) <= 1 && (psq >> 3) > rank)
-							return false;
-					}
-					return true;
-				}
-			};
-
-		// White passed pawns
-		for (int i = 0; i < b.pieceCount[WP]; i++) {
-			int sq = b.pieceList[WP][i];
-			// White advances toward smaller board rows, so invert the row index.
-			int advancedRanks = 7 - (sq >> 3);
-			if (isPassed(sq, true)) score += 40 + 10 * advancedRanks;
-		}
-
-		// Black passed pawns
-		for (int i = 0; i < b.pieceCount[BP]; i++) {
-			int sq = b.pieceList[BP][i];
-			// Black advances toward larger board rows.
-			int advancedRanks = sq >> 3;
-			if (isPassed(sq, false)) score -= 40 + 10 * advancedRanks;
-		}
-	}
-
-	// ----------------------------------------------------------
-	// DOUBLED PAWNS
-	// ----------------------------------------------------------
-	{
-		PROFILE_TIMER(::Profiler::EvalPawnStructureTime);
-		int wFileCnt[8] = { 0 }, bFileCnt[8] = { 0 };
-
-		for (int i = 0; i < b.pieceCount[WP]; i++)
-			wFileCnt[b.pieceList[WP][i] & 7]++;
-
-		for (int i = 0; i < b.pieceCount[BP]; i++)
-			bFileCnt[b.pieceList[BP][i] & 7]++;
-
-		for (int f = 0; f < 8; f++) {
-			if (wFileCnt[f] > 1) score -= 15 * (wFileCnt[f] - 1);
-			if (bFileCnt[f] > 1) score += 15 * (bFileCnt[f] - 1);
-		}
-	}
-
-	// ----------------------------------------------------------
-	// KING SAFETY (big Elo booster)
-	// ----------------------------------------------------------
-	{
-		PROFILE_TIMER(::Profiler::EvalKingSafetyTime);
-		int wKing = b.pieceList[WK][0];
-		int bKing = b.pieceList[BK][0];
-
-		Bitboard whiteAttacks = attackMapForSide(b, true);
-		Bitboard blackAttacks = attackMapForSide(b, false);
-		int atkWhiteKing = Bitboards::popcount(kingSafetyZoneMask(wKing) & blackAttacks);
-		int atkBlackKing = Bitboards::popcount(kingSafetyZoneMask(bKing) & whiteAttacks);
-
-		score -= atkWhiteKing * 20;
-		score += atkBlackKing * 20;
-
-		// ----------------------------------------------------------
-		// KING PAWN SHIELD
-		// ----------------------------------------------------------
-		auto pawnShield = [&](int ksq, bool isWhite) {
-			int r = ksq >> 3, c = ksq & 7;
-			int s = 0;
-
-			// The shield is on the rank in front of the king, including back-rank castled kings.
-			if (isWhite && r > 0)
-			{
-				int front = r - 1;
-				if (b.pieceAt(front * 8 + c) == WP) s += 15;
-				if (c > 0 && b.pieceAt(front * 8 + c - 1) == WP) s += 10;
-				if (c < 7 && b.pieceAt(front * 8 + c + 1) == WP) s += 10;
-			}
-			else if (!isWhite && r < 7)
-			{
-				int front = r + 1;
-				if (b.pieceAt(front * 8 + c) == BP) s += 15;
-				if (c > 0 && b.pieceAt(front * 8 + c - 1) == BP) s += 10;
-				if (c < 7 && b.pieceAt(front * 8 + c + 1) == BP) s += 10;
-			}
-			return s;
-			};
-
-		score += pawnShield(wKing, true);
-		score -= pawnShield(bKing, false);
-
-		// ----------------------------------------------------------
-		// OPEN FILES NEAR KING
-		// ----------------------------------------------------------
-		bool wPawnFiles[8] = { false };
-		bool bPawnFiles[8] = { false };
-		for (int i = 0; i < b.pieceCount[WP]; i++) {
-			wPawnFiles[b.pieceList[WP][i] & 7] = true;
-		}
-		for (int i = 0; i < b.pieceCount[BP]; i++) {
-			bPawnFiles[b.pieceList[BP][i] & 7] = true;
-		}
-
-		auto fileHasPawn = [&](int f, bool white) {
-			return white ? wPawnFiles[f] : bPawnFiles[f];
-			};
-
-		auto kingOpenPenalty = [&](int ksq, bool white) {
-			int f = ksq & 7;
-			int s = 0;
-			if (!fileHasPawn(f, white)) s -= 15;
-			if (f > 0 && !fileHasPawn(f - 1, white)) s -= 10;
-			if (f < 7 && !fileHasPawn(f + 1, white)) s -= 10;
-			return s;
-			};
-
-		score += kingOpenPenalty(wKing, true);
-		score -= kingOpenPenalty(bKing, false);
-
-		// ----------------------------------------------------------
-		// CASTLED BONUS
-		// ----------------------------------------------------------
-		if (wKing == 62 || wKing == 58) score += 40;
-		if (bKing == 6 || bKing == 2) score -= 40;
-
-		// ----------------------------------------------------------
-		// KING IN CENTER AFTER MOVE 10
-		// ----------------------------------------------------------
-		auto isCenter = [&](int sq) {
-			int r = sq >> 3, c = sq & 7;
-			return (r >= 2 && r <= 5 && c >= 2 && c <= 5);
-			};
-
-		if (b.fullmoveNumber > 10)
-		{
-			if (isCenter(wKing)) score -= 40;
-			if (isCenter(bKing)) score += 40;
-		}
-	}
-
-	// ----------------------------------------------------------
-	// SIDE TO MOVE BONUS
-	// ----------------------------------------------------------
-	return b.isWhiteTurn ? score : -score;
+	return evaluateClassical(b, nullptr);
 }
 
+int Engine::debugEvaluate(board& b)
+{
+	return evaluate(b);
+}
+
+int Engine::debugEvaluateLegacy(const board& b) const
+{
+	return evaluateLegacyPosition(b);
+}
+
+std::string Engine::debugEvaluateBreakdown(board& b)
+{
+	PROFILE_INC(::Profiler::EvalCalls);
+	PROFILE_TIMER(::Profiler::EvalTime);
+	EvalBreakdown breakdown;
+	const int score = evaluateClassical(b, &breakdown);
+
+	std::ostringstream out;
+	out << "phase " << breakdown.phase << "/" << EvalMaxPhase
+		<< " finalWhite " << breakdown.finalWhiteScore
+		<< " finalSide " << score
+		<< " attackUnitsW " << breakdown.whiteAttackUnits
+		<< " attackUnitsB " << breakdown.blackAttackUnits
+		<< " kingZoneHitsW " << breakdown.whiteKingZoneHits
+		<< " kingZoneHitsB " << breakdown.blackKingZoneHits << '\n';
+
+	auto append = [&](const char* name, const EvalScore& term) {
+		out << name << " mg " << term.mg
+			<< " eg " << term.eg
+			<< " blended " << blendScore(term, breakdown.phase) << '\n';
+		};
+
+	append("materialPst", breakdown.materialPst);
+	append("pawns", breakdown.pawns);
+	append("mobility", breakdown.mobility);
+	append("rooks", breakdown.rooks);
+	append("bishopPair", breakdown.bishopPair);
+	append("kingSafety", breakdown.kingSafety);
+	append("kingActivity", breakdown.kingActivity);
+	append("total", breakdown.total);
+	return out.str();
+}
 
 struct RootSearchResult {
 	Move move;

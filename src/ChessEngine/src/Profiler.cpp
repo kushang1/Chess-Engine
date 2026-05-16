@@ -108,6 +108,7 @@ constexpr const char* CounterNames[FlatCounterCount] = {
     "evalPawnStructureTime",
     "evalKingSafetyTime",
     "evalPassedPawnTime",
+    "evalAttackGenerationTime",
     "scoreMoveCalls",
     "ttMoveScoreHits",
     "promotionScored",
@@ -418,6 +419,7 @@ void appendEvaluationSummary(std::string& out)
     appendTimerSummaryLine(out, "evalPassedPawnTimeNs", g_counters[Profiler::EvalPassedPawnTime]);
     appendTimerSummaryLine(out, "evalPawnStructureTimeNs", g_counters[Profiler::EvalPawnStructureTime]);
     appendTimerSummaryLine(out, "evalKingSafetyTimeNs", g_counters[Profiler::EvalKingSafetyTime]);
+    appendTimerSummaryLine(out, "evalAttackGenerationTimeNs", g_counters[Profiler::EvalAttackGenerationTime]);
 
     out += "move ordering summary\n";
     appendLine(out, "scoreMoveCalls", g_counters[Profiler::ScoreMoveCalls]);
