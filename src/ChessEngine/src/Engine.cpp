@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <new>
 #include <random>
 #include <sstream>
@@ -34,6 +35,9 @@ static const int MATE_THRESHOLD = MATE_SCORE - 10000;
 
 static const int INF = 2000000000;
 static const int SEARCH_ABORTED = -2000000001;
+static const int TT_SCORE_LIMIT = 30000;
+static const int TT_MATE_SCORE = 32000;
+static const int TT_MATE_THRESHOLD = 31000;
 
 static inline bool isSearchAborted(int score)
 {
@@ -56,6 +60,17 @@ std::mt19937_64& bookRng()
 	return rng;
 }
 
+int promotionKind(Piece piece)
+{
+	switch (piece) {
+	case WQ: case BQ: return 1;
+	case WR: case BR: return 2;
+	case WB: case BB: return 3;
+	case WN: case BN: return 4;
+	default: return 0;
+	}
+}
+
 bool sameMoveIdentity(const Move& lhs, const Move& rhs)
 {
 	if (lhs.from != rhs.from || lhs.to != rhs.to) {
@@ -64,7 +79,8 @@ bool sameMoveIdentity(const Move& lhs, const Move& rhs)
 	if (lhs.wasPromotion != rhs.wasPromotion) {
 		return false;
 	}
-	return !lhs.wasPromotion || lhs.promotedTo == rhs.promotedTo;
+	return !lhs.wasPromotion ||
+		promotionKind(lhs.promotedTo) == promotionKind(rhs.promotedTo);
 }
 
 bool findLegalEquivalent(const std::vector<Move>& legalMoves, const Move& candidate, Move& legalMove)
@@ -392,20 +408,22 @@ void Engine::resizeTranspositionTable(int megabytes)
 	megabytes = std::clamp(megabytes, MinHashMb, MaxHashMb);
 
 	const uint64_t bytes = static_cast<uint64_t>(megabytes) * 1024ULL * 1024ULL;
-	uint64_t entries = floorPowerOfTwo(bytes / sizeof(TTEntry));
-	if (entries == 0) {
-		entries = 1;
+	uint64_t clusters = floorPowerOfTwo(bytes / sizeof(TTCluster));
+	if (clusters == 0) {
+		clusters = 1;
 	}
 
-	TTEntry* newTable = new (std::nothrow) TTEntry[entries]();
+	TTCluster* newTable = new (std::nothrow) TTCluster[clusters]();
 	if (newTable == nullptr) {
 		return;
 	}
 
 	delete[] tt;
 	tt = newTable;
-	ttSize = entries;
-	ttMask = entries - 1;
+	ttClusterCount = clusters;
+	ttClusterMask = clusters - 1;
+	ttUsedEntries = 0;
+	currentGeneration = 0;
 }
 
 void Engine::clearStop()
@@ -428,26 +446,270 @@ long long Engine::leafNodesSearched() const
 	return leafNodes.load(std::memory_order_relaxed);
 }
 
-int Engine::scoreToTT(int score, int ply) const
+void Engine::clearTT()
 {
-	if (score >= MATE_THRESHOLD) {
-		return score + ply;
+	if (tt == nullptr || ttClusterCount == 0) {
+		return;
 	}
-	if (score <= -MATE_THRESHOLD) {
-		return score - ply;
-	}
-	return score;
+	std::memset(tt, 0, sizeof(TTCluster) * ttClusterCount);
+	ttUsedEntries = 0;
 }
 
-int Engine::scoreFromTT(int score, int ply) const
+void Engine::newSearch()
+{
+	currentGeneration = static_cast<uint8_t>((currentGeneration + 1) & 0x3F);
+}
+
+uint8_t Engine::entryGeneration(const TTEntry& entry)
+{
+	return static_cast<uint8_t>(entry.generationBound >> 2);
+}
+
+Engine::TTBound Engine::entryBound(const TTEntry& entry)
+{
+	return static_cast<TTBound>(entry.generationBound & 0x03);
+}
+
+void Engine::setGenerationBound(TTEntry& entry, uint8_t generation, TTBound bound)
+{
+	entry.generationBound = static_cast<uint8_t>(
+		((generation & 0x3F) << 2) | (static_cast<uint8_t>(bound) & 0x03));
+}
+
+uint8_t Engine::generationAge(uint8_t entryGen) const
+{
+	return static_cast<uint8_t>((currentGeneration - entryGen) & 0x3F);
+}
+
+int Engine::replacementScore(const TTEntry& entry) const
+{
+	const int exactBonus = entryBound(entry) == TTBound::Exact ? 8 : 0;
+	const int agePenalty = static_cast<int>(generationAge(entryGeneration(entry))) * 4;
+	return static_cast<int>(entry.depth) + exactBonus - agePenalty;
+}
+
+uint16_t Engine::key16(uint64_t key) const
+{
+	return static_cast<uint16_t>(key >> 48);
+}
+
+uint16_t Engine::packMove(const Move& move) const
+{
+	if (move.from < 0 || move.from >= 64 || move.to < 0 || move.to >= 64) {
+		return 0;
+	}
+
+	uint16_t flags = 0;
+	if (move.wasPromotion) {
+		flags = static_cast<uint16_t>(promotionKind(move.promotedTo));
+	}
+
+	return static_cast<uint16_t>(
+		(static_cast<uint16_t>(move.from) & 0x3F) |
+		((static_cast<uint16_t>(move.to) & 0x3F) << 6) |
+		((flags & 0x0F) << 12));
+}
+
+Move Engine::unpackMove(uint16_t packed) const
+{
+	if (packed == 0) {
+		return Move();
+	}
+
+	Move move;
+	move.from = packed & 0x3F;
+	move.to = (packed >> 6) & 0x3F;
+
+	const uint16_t flags = (packed >> 12) & 0x0F;
+	if (flags != 0) {
+		move.wasPromotion = true;
+		switch (flags) {
+		case 2: move.promotedTo = WR; break;
+		case 3: move.promotedTo = WB; break;
+		case 4: move.promotedTo = WN; break;
+		case 1:
+		default:
+			move.promotedTo = WQ;
+			break;
+		}
+	}
+
+	return move;
+}
+
+int16_t Engine::packStaticEval(int staticEval) const
+{
+	if (staticEval == TT_NO_STATIC_EVAL) {
+		return static_cast<int16_t>(TT_NO_STATIC_EVAL);
+	}
+	return static_cast<int16_t>(
+		std::clamp(staticEval, -TT_SCORE_LIMIT, TT_SCORE_LIMIT));
+}
+
+int16_t Engine::scoreToTT(int score, int ply) const
 {
 	if (score >= MATE_THRESHOLD) {
-		return score - ply;
+		const int normalized = score + ply;
+		const int distance = std::clamp(MATE_SCORE - normalized, 0, 1000);
+		return static_cast<int16_t>(TT_MATE_SCORE - distance);
 	}
 	if (score <= -MATE_THRESHOLD) {
-		return score + ply;
+		const int normalized = score - ply;
+		const int distance = std::clamp(MATE_SCORE + normalized, 0, 1000);
+		return static_cast<int16_t>(-TT_MATE_SCORE + distance);
 	}
-	return score;
+	return static_cast<int16_t>(std::clamp(score, -TT_SCORE_LIMIT, TT_SCORE_LIMIT));
+}
+
+int Engine::scoreFromTT(int16_t score, int ply) const
+{
+	if (score >= TT_MATE_THRESHOLD) {
+		const int distance = TT_MATE_SCORE - score;
+		return MATE_SCORE - distance - ply;
+	}
+	if (score <= -TT_MATE_THRESHOLD) {
+		const int distance = score + TT_MATE_SCORE;
+		return -MATE_SCORE + distance + ply;
+	}
+	return static_cast<int>(score);
+}
+
+Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply) const
+{
+	TTProbeResult result;
+	if (tt == nullptr || ttClusterCount == 0) {
+		return result;
+	}
+
+	PROFILE_INC(::Profiler::TTProbes);
+	const TTCluster& cluster = tt[key & ttClusterMask];
+	const uint16_t verify = key16(key);
+	bool occupied = false;
+
+	for (int slot = 0; slot < 4; ++slot) {
+		const TTEntry& entry = cluster.entries[slot];
+		const TTBound bound = entryBound(entry);
+		if (bound == TTBound::Empty) {
+			continue;
+		}
+
+		occupied = true;
+		if (entry.key16 != verify) {
+			continue;
+		}
+
+		PROFILE_INC(::Profiler::TTHits);
+#ifdef ENABLE_ENGINE_PROFILING
+		PROFILE_INC(static_cast<::Profiler::CounterId>(
+			static_cast<int>(::Profiler::TTSlotHit0) + slot));
+#endif
+		if (bound == TTBound::Exact) {
+			PROFILE_INC(::Profiler::TTExactHits);
+		}
+		else if (bound == TTBound::Lower) {
+			PROFILE_INC(::Profiler::TTLowerHits);
+			PROFILE_INC(::Profiler::TTBetaHits);
+		}
+		else if (bound == TTBound::Upper) {
+			PROFILE_INC(::Profiler::TTUpperHits);
+			PROFILE_INC(::Profiler::TTAlphaHits);
+		}
+
+		result.hit = true;
+		result.score = scoreFromTT(entry.score, ply);
+		result.depth = static_cast<int>(entry.depth);
+		result.bound = bound;
+		result.move = unpackMove(entry.move16);
+		result.hasMove = entry.move16 != 0 &&
+			result.move.from >= 0 && result.move.to >= 0;
+		result.hasStaticEval = entry.staticEval != TT_NO_STATIC_EVAL;
+		if (result.hasStaticEval) {
+			result.staticEval = static_cast<int>(entry.staticEval);
+		}
+		return result;
+	}
+
+	PROFILE_INC(::Profiler::TTMisses);
+	if (occupied) {
+		PROFILE_INC(::Profiler::TTCollisionMisses);
+	}
+	return result;
+}
+
+void Engine::storeTT(uint64_t key, int depth, int score, TTBound bound,
+	const Move& bestMove, int ply, int staticEval)
+{
+	if (tt == nullptr || ttClusterCount == 0 || bound == TTBound::Empty) {
+		return;
+	}
+
+	TTCluster& cluster = tt[key & ttClusterMask];
+	const uint16_t verify = key16(key);
+	const uint16_t packedMove = packMove(bestMove);
+
+	TTEntry* target = nullptr;
+	TTEntry* empty = nullptr;
+	TTEntry* replacement = &cluster.entries[0];
+	int replacementValue = replacementScore(*replacement);
+
+	for (TTEntry& entry : cluster.entries) {
+		const TTBound entryType = entryBound(entry);
+		if (entryType != TTBound::Empty && entry.key16 == verify) {
+			target = &entry;
+			break;
+		}
+		if (entryType == TTBound::Empty && empty == nullptr) {
+			empty = &entry;
+		}
+		const int value = replacementScore(entry);
+		if (value < replacementValue) {
+			replacementValue = value;
+			replacement = &entry;
+		}
+	}
+
+	if (target == nullptr) {
+		target = empty != nullptr ? empty : replacement;
+	}
+
+	const bool replacingOccupied = entryBound(*target) != TTBound::Empty;
+	const bool replacingDifferent = replacingOccupied &&
+		(target->key16 != verify || target->move16 != packedMove);
+
+	PROFILE_INC(::Profiler::TTStores);
+	if (replacingOccupied) {
+		PROFILE_INC(::Profiler::TTOverwrites);
+		if (replacingDifferent) {
+			if (generationAge(entryGeneration(*target)) != 0) {
+				PROFILE_INC(::Profiler::TTReplacedByAge);
+			}
+			else {
+				PROFILE_INC(::Profiler::TTReplacedByDepth);
+			}
+		}
+	}
+	else {
+		++ttUsedEntries;
+	}
+
+	target->key16 = verify;
+	target->move16 = packedMove;
+	target->score = scoreToTT(score, ply);
+	target->staticEval = packStaticEval(staticEval);
+	target->depth = static_cast<uint8_t>(std::clamp(depth, 0, 255));
+	target->reserved = 0;
+	setGenerationBound(*target, currentGeneration, bound);
+}
+
+int Engine::ttHashfullPermille() const
+{
+	if (tt == nullptr || ttClusterCount == 0) {
+		return 0;
+	}
+
+	const uint64_t capacity = ttClusterCount * 4ULL;
+	return static_cast<int>(std::min<uint64_t>(
+		1000ULL, (ttUsedEntries * 1000ULL) / capacity));
 }
 
 bool Engine::shouldStop()
@@ -1921,11 +2183,15 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	const std::vector<Move>& rootMoveFilter)
 {
 	resetSearchStats();
+	newSearch();
 	
 
 	maxDepth = std::clamp(maxDepth, 1, MAX_DEPTH - 1);
 	this->maxDepth = maxDepth;
 	const bool emitUciInfo = uciInfoOutputEnabled();
+	auto recordTTHashfull = [&]() {
+		PROFILE_MAX(::Profiler::TTHashfullPermille, ttHashfullPermille());
+		};
 
 	// --------------------------------------------
 	// Search start time and repetition root.
@@ -1964,6 +2230,7 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	}
 
 	if (rootMoves.empty()) {
+		recordTTHashfull();
 		return Move(-1, -1, EMPTY, EMPTY, 0);
 	}
 
@@ -1979,6 +2246,7 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 	if(rootMoves.size() == 1)
 	{
+		recordTTHashfull();
 		return rootMoves[0];
 	}
 
@@ -1988,6 +2256,7 @@ Move Engine::findBestMove(board& b, int maxDepth,
 		if (probeSyzygyRoot(b, tbScore, tbMove)) {
 			Move legalTbMove;
 			if (findLegalEquivalent(rootMoves, tbMove, legalTbMove)) {
+				recordTTHashfull();
 				return legalTbMove;
 			}
 		}
@@ -2285,11 +2554,14 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 
 	if (haveFull) {
+		recordTTHashfull();
 		return bestFullMove;
 	}
 	if (haveSafe) {
+		recordTTHashfull();
 		return bestSafeMove;
 	}
+	recordTTHashfull();
 	return rootMoves[0];
 }
 
@@ -2340,55 +2612,39 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 
 	RepetitionFrame repetitionFrame(repHistory, key);
 	int alphaOrig = alpha;
+	int nodeStaticEval = TT_NO_STATIC_EVAL;
 
 	// -------------------------------
 	// TRANSPOSITION TABLE PROBE
 	// -------------------------------
-	TTEntry* entry = (tt != nullptr && ttSize != 0) ? &tt[key & ttMask] : nullptr;
-	if (entry != nullptr) {
-		PROFILE_INC(::Profiler::TTProbes);
-	}
-
 	Move ttMove;
 	bool haveTTMove = false;
+	TTProbeResult ttResult = probeTT(key, ply);
 
-	if (entry != nullptr && entry->flag != TT_EMPTY && entry->key == key)
-	{
-		PROFILE_INC(::Profiler::TTHits);
-		if (entry->flag == TT_EXACT) {
-			PROFILE_INC(::Profiler::TTExactHits);
-		}
-		else if (entry->flag == TT_ALPHA) {
-			PROFILE_INC(::Profiler::TTAlphaHits);
-		}
-		else if (entry->flag == TT_BETA) {
-			PROFILE_INC(::Profiler::TTBetaHits);
-		}
-
+	if (ttResult.hit) {
 		// Always keep the stored best move for ordering, even from shallow entries.
-		ttMove = entry->bestMove;
-		haveTTMove = ttMove.from != -1 && ttMove.to != -1;
+		ttMove = ttResult.move;
+		haveTTMove = ttResult.hasMove;
+		if (ttResult.hasStaticEval) {
+			nodeStaticEval = ttResult.staticEval;
+		}
 
-		if (entry->depth >= depth) {
-			int stored = scoreFromTT(entry->score, ply);
+		if (ttResult.depth >= depth) {
+			const int stored = ttResult.score;
 
-			if (entry->flag == TT_EXACT) {
+			if (ttResult.bound == TTBound::Exact) {
 				PROFILE_INC(::Profiler::TTCutoffs);
 				return stored;
 			}
-			else if (entry->flag == TT_ALPHA && stored <= alpha) {
+			if (ttResult.bound == TTBound::Upper && stored <= alpha) {
 				PROFILE_INC(::Profiler::TTCutoffs);
 				return stored;
 			}
-			else if (entry->flag == TT_BETA && stored >= beta) {
+			if (ttResult.bound == TTBound::Lower && stored >= beta) {
 				PROFILE_INC(::Profiler::TTCutoffs);
 				return stored;
 			}
 		}
-
-	}
-	else if (entry != nullptr) {
-		PROFILE_INC(::Profiler::TTMisses);
 	}
 
 	// Avoid tablebase overhead in the normal hot path; count pieces only when
@@ -2401,19 +2657,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		int tbScore;
 		Move tbMove;
 		if (totalPieces <= (int)TB_LARGEST && probeSyzygy(b, tbScore, tbMove)) {
-
-			if (tt != nullptr && ttSize != 0) {
-				TTEntry& tbEntry = tt[key & ttMask];
-				PROFILE_INC(::Profiler::TTStores);
-				if (tbEntry.flag != TT_EMPTY) {
-					PROFILE_INC(::Profiler::TTOverwrites);
-				}
-				tbEntry.key = key;
-				tbEntry.score = scoreToTT(tbScore, ply);
-				tbEntry.depth = 127;     // highest possible depth
-				tbEntry.flag = TT_EXACT;
-				tbEntry.bestMove = tbMove;
-			}
+			storeTT(key, 127, tbScore, TTBound::Exact, tbMove, ply, nodeStaticEval);
 
 			return tbScore;
 		}
@@ -2459,6 +2703,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		if (hasNonPawnMaterial) {
 			PROFILE_INC(::Profiler::NullMoveAttempts);
 			int staticEval = evaluate(b);
+			nodeStaticEval = staticEval;
 			// Save state we touch
 			bool prevTurn = b.isWhiteTurn;
 			bool prevHasEP = b.hasEnPassant;
@@ -2570,10 +2815,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		}
 
 		bool isTTMove = false;
-		if (haveTTMove &&
-			move.from == ttMove.from &&
-			move.to == ttMove.to &&
-			move.moved == ttMove.moved)
+		if (haveTTMove && sameMoveIdentity(move, ttMove))
 		{
 			PROFILE_INC(::Profiler::TTMoveTried);
 			isTTMove = true;
@@ -2787,33 +3029,15 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	// STORE TT ENTRY
 	// Do not store partial results after a timeout/stop abort.
 	// -----------------------------------
-	if (tt == nullptr || ttSize == 0) {
-		return besteval;
+	TTBound bound = TTBound::Exact;
+	if (besteval <= alphaOrig) {
+		bound = TTBound::Upper;  // fail-low
+	}
+	else if (besteval >= beta) {
+		bound = TTBound::Lower;  // fail-high
 	}
 
-	TTEntry& store = tt[key & ttMask];
-	if (store.flag != TT_EMPTY && store.key != key && store.depth > depth + 2) {
-		PROFILE_INC(::Profiler::TTKeptDueToDepth);
-		return besteval;
-	}
-
-	PROFILE_INC(::Profiler::TTStores);
-	if (store.flag != TT_EMPTY) {
-		PROFILE_INC(::Profiler::TTOverwrites);
-	}
-
-	store.key = key;
-	store.score = scoreToTT(besteval, ply);
-	store.depth = depth;
-
-	if (besteval <= alphaOrig)
-		store.flag = TT_ALPHA;  // fail-low
-	else if (besteval >= beta)
-		store.flag = TT_BETA;   // fail-high
-	else
-		store.flag = TT_EXACT;  // exact score
-
-	store.bestMove = bestMoveLocal;
+	storeTT(key, depth, besteval, bound, bestMoveLocal, ply, nodeStaticEval);
 
 	return besteval;
 }

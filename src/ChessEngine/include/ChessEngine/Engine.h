@@ -12,6 +12,7 @@
 #include "Syzygy.h"
 #include <chrono>
 #include "Polyglot.h"
+#include <cstdint>
 #include <unordered_map>
 
 class CHESS_API Engine {
@@ -58,29 +59,69 @@ private:
         return b.hash;
     }
 
-    // --- TT STRUCTS ---
-    enum TTFlag : uint8_t {
-        TT_EMPTY = 0,
-        TT_EXACT = 1,
-        TT_ALPHA = 2,
-        TT_BETA = 3
+    enum class TTBound : uint8_t {
+        Empty = 0,
+        Exact = 1,
+        Lower = 2,
+        Upper = 3
     };
 
-    struct TTEntry {
-        uint64_t key = 0;
+    static constexpr int TT_NO_STATIC_EVAL = -32768;
+
+    struct alignas(16) TTEntry {
+        uint16_t key16 = 0;
+        uint16_t move16 = 0;
+        int16_t score = 0;
+        int16_t staticEval = TT_NO_STATIC_EVAL;
+        uint8_t depth = 0;
+        uint8_t generationBound = 0;
+        uint16_t reserved = 0;
+    };
+
+    static_assert(sizeof(TTEntry) == 16, "TTEntry must stay 16 bytes");
+
+    struct alignas(64) TTCluster {
+        TTEntry entries[4];
+    };
+
+    static_assert(sizeof(TTCluster) == 64, "TTCluster must stay one cache line");
+    static_assert(alignof(TTCluster) == 64, "TTCluster must be cache-line aligned");
+
+    struct TTProbeResult {
+        bool hit = false;
         int score = 0;
         int depth = -1;
-        TTFlag flag = TT_EMPTY;
-        Move bestMove;
+        TTBound bound = TTBound::Empty;
+        Move move;
+        bool hasMove = false;
+        int staticEval = 0;
+        bool hasStaticEval = false;
     };
 
-    TTEntry* tt = nullptr;
-    uint64_t ttSize = 0;
-    uint64_t ttMask = 0;
+    TTCluster* tt = nullptr;
+    uint64_t ttClusterCount = 0;
+    uint64_t ttClusterMask = 0;
+    uint64_t ttUsedEntries = 0;
+    uint8_t currentGeneration = 0;
 
     void resizeTranspositionTable(int megabytes);
-    int scoreToTT(int score, int ply) const;
-    int scoreFromTT(int score, int ply) const;
+    void clearTT();
+    void newSearch();
+    TTProbeResult probeTT(uint64_t key, int ply) const;
+    void storeTT(uint64_t key, int depth, int score, TTBound bound,
+        const Move& bestMove, int ply, int staticEval = TT_NO_STATIC_EVAL);
+    int ttHashfullPermille() const;
+    static uint8_t entryGeneration(const TTEntry& entry);
+    static TTBound entryBound(const TTEntry& entry);
+    static void setGenerationBound(TTEntry& entry, uint8_t generation, TTBound bound);
+    uint8_t generationAge(uint8_t entryGeneration) const;
+    int replacementScore(const TTEntry& entry) const;
+    uint16_t key16(uint64_t key) const;
+    uint16_t packMove(const Move& move) const;
+    Move unpackMove(uint16_t packed) const;
+    int16_t packStaticEval(int staticEval) const;
+    int16_t scoreToTT(int score, int ply) const;
+    int scoreFromTT(int16_t score, int ply) const;
     bool shouldStop();
 
     std::atomic<bool> stopSearch;

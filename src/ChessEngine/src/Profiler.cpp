@@ -150,6 +150,16 @@ constexpr const char* CounterNames[FlatCounterCount] = {
     "ttKeptDueToDepth",
     "ttMoveTried",
     "ttMoveCutoffs",
+    "ttSlotHits[0]",
+    "ttSlotHits[1]",
+    "ttSlotHits[2]",
+    "ttSlotHits[3]",
+    "ttCollisionMisses",
+    "ttReplacedByAge",
+    "ttReplacedByDepth",
+    "ttLowerHits",
+    "ttUpperHits",
+    "ttHashfullPermille",
     "pruningAttempts",
     "pruningCutoffs",
     "moveOrderingCutoffs",
@@ -454,10 +464,39 @@ void appendTTSummary(std::string& out)
     uint64_t probes = counterValue(Profiler::TTProbes);
     uint64_t hits = counterValue(Profiler::TTHits);
     uint64_t cutoffs = counterValue(Profiler::TTCutoffs);
+    uint64_t slotHits =
+        counterValue(Profiler::TTSlotHit0) +
+        counterValue(Profiler::TTSlotHit1) +
+        counterValue(Profiler::TTSlotHit2) +
+        counterValue(Profiler::TTSlotHit3);
 
     out += "tt summary\n";
     appendRateLine(out, "ttHitRate", hits, probes);
     appendRateLine(out, "ttCutoffRate", cutoffs, probes);
+    appendRateLine(out, "ttCollisionMissRate",
+        counterValue(Profiler::TTCollisionMisses), probes);
+    appendRateLine(out, "ttExactHitRate",
+        counterValue(Profiler::TTExactHits), hits);
+    appendRateLine(out, "ttLowerHitRate",
+        counterValue(Profiler::TTLowerHits), hits);
+    appendRateLine(out, "ttUpperHitRate",
+        counterValue(Profiler::TTUpperHits), hits);
+    appendRateLine(out, "ttSlot0HitShare",
+        counterValue(Profiler::TTSlotHit0), slotHits);
+    appendRateLine(out, "ttSlot1HitShare",
+        counterValue(Profiler::TTSlotHit1), slotHits);
+    appendRateLine(out, "ttSlot2HitShare",
+        counterValue(Profiler::TTSlotHit2), slotHits);
+    appendRateLine(out, "ttSlot3HitShare",
+        counterValue(Profiler::TTSlotHit3), slotHits);
+    appendLine(out, "ttReplacedByAge", g_counters[Profiler::TTReplacedByAge]);
+    appendLine(out, "ttReplacedByDepth", g_counters[Profiler::TTReplacedByDepth]);
+    char line[192];
+    std::snprintf(line, sizeof(line), "%-32s %llu permille\n",
+        "ttHashfullEstimate",
+        static_cast<unsigned long long>(
+            g_counters[Profiler::TTHashfullPermille].maxValue));
+    out += line;
 }
 
 #endif // ENABLE_ENGINE_PROFILING

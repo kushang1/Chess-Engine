@@ -242,7 +242,7 @@ void UciLoop::handleSetOption(const std::vector<std::string>& tokens)
         return;
     }
 
-    std::string name = joinTokens(tokens, nameIndex, valueIndex - 1);
+    std::string name = joinTokens(tokens, nameIndex, valueIndex - 2);
     if (name == "Move Overhead") {
         moveOverheadMs = std::clamp(parseInt(tokens[valueIndex], moveOverheadMs), 0, 5000);
     }
