@@ -152,16 +152,16 @@ void ChessBoardWidget::animateMove(int from, int to, const std::array<Piece, 64>
 
 void ChessBoardWidget::setLegalMoves(const std::vector<Move>& moves)
 {
-    m_legalTargets.clear();
-    m_captureTargets.clear();
+    m_legalTargets.reset();
+    m_captureTargets.reset();
 
     for (const Move& move : moves) {
         if (move.to < 0 || move.to >= 64) {
             continue;
         }
-        m_legalTargets.insert(move.to);
+        m_legalTargets.set(static_cast<std::size_t>(move.to));
         if (move.captured != EMPTY || move.wasEnPassant || hasPiece(m_position[move.to])) {
-            m_captureTargets.insert(move.to);
+            m_captureTargets.set(static_cast<std::size_t>(move.to));
         }
     }
 
@@ -170,8 +170,8 @@ void ChessBoardWidget::setLegalMoves(const std::vector<Move>& moves)
 
 void ChessBoardWidget::clearLegalMoves()
 {
-    m_legalTargets.clear();
-    m_captureTargets.clear();
+    m_legalTargets.reset();
+    m_captureTargets.reset();
     update();
 }
 
@@ -533,9 +533,12 @@ void ChessBoardWidget::drawHighlights(QPainter& painter)
     }
 
     painter.setRenderHint(QPainter::Antialiasing, true);
-    for (int square : m_legalTargets) {
+    for (int square = 0; square < 64; ++square) {
+        if (!m_legalTargets.test(static_cast<std::size_t>(square))) {
+            continue;
+        }
         const QRectF rect = squareRect(square);
-        if (m_captureTargets.contains(square)) {
+        if (m_captureTargets.test(static_cast<std::size_t>(square))) {
             painter.setPen(QPen(QColor(35, 35, 35, 96), std::max<qreal>(4.0, cell * 0.06)));
             painter.setBrush(Qt::NoBrush);
             painter.drawEllipse(rect.center(), cell * 0.39, cell * 0.39);

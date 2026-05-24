@@ -147,13 +147,6 @@ void board::movePiece(Piece p, int from, int to) {
     hash ^= ZobristData::pieceSquare(p, to);
 }
 
-Piece board::pieceAt(int sq) const {
-    if (sq < 0 || sq >= 64) {
-        return EMPTY;
-    }
-    return squareBoard[sq];
-}
-
 void board::resetBoard() {
     loadFEN(START_FEN);
 }

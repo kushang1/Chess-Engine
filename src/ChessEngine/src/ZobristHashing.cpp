@@ -15,6 +15,22 @@ uint64_t splitmix64(uint64_t& state) {
 
 namespace ZobristData {
 
+constexpr std::array<int, 13> PieceToZobristIndex = {
+    -1, // EMPTY
+    10, // BQ
+    9,  // BR
+    6,  // BP
+    7,  // BN
+    11, // BK
+    8,  // BB
+    4,  // WQ
+    3,  // WR
+    0,  // WP
+    1,  // WN
+    5,  // WK
+    2   // WB
+};
+
 static PieceSquareTable g_pieceSquare{};
 static std::array<uint64_t, 2> g_sideToMove{};
 static std::array<uint64_t, 16> g_castlingRights{};
@@ -49,21 +65,10 @@ void init() {
 }
 
 int pieceIndex(Piece p) {
-    switch (p) {
-    case WP: return 0;
-    case WN: return 1;
-    case WB: return 2;
-    case WR: return 3;
-    case WQ: return 4;
-    case WK: return 5;
-    case BP: return 6;
-    case BN: return 7;
-    case BB: return 8;
-    case BR: return 9;
-    case BQ: return 10;
-    case BK: return 11;
-    default: return -1;
-    }
+    const int index = static_cast<int>(p);
+    return index >= 0 && index < static_cast<int>(PieceToZobristIndex.size())
+        ? PieceToZobristIndex[index]
+        : -1;
 }
 
 uint64_t pieceSquare(Piece p, int sq) {

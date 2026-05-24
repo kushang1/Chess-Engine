@@ -5,10 +5,10 @@
 #include <QColor>
 #include <QPoint>
 #include <QPixmap>
-#include <QSet>
 #include <QWidget>
 
 #include <array>
+#include <bitset>
 #include <vector>
 
 class QParallelAnimationGroup;
@@ -103,8 +103,8 @@ private:
     std::array<Piece, 64> m_pendingPosition{};
     std::array<QPixmap, 13> m_piecePixmaps{};
 
-    QSet<int> m_legalTargets;
-    QSet<int> m_captureTargets;
+    std::bitset<64> m_legalTargets;
+    std::bitset<64> m_captureTargets;
 
     int m_selectedSquare = -1;
     int m_lastFrom = -1;

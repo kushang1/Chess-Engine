@@ -107,7 +107,7 @@ private:
     void resizeTranspositionTable(int megabytes);
     void clearTT();
     void newSearch();
-    TTProbeResult probeTT(uint64_t key, int ply) const;
+    TTProbeResult probeTT(uint64_t key, int ply);
     void storeTT(uint64_t key, int depth, int score, TTBound bound,
         const Move& bestMove, int ply, int staticEval = TT_NO_STATIC_EVAL);
     int ttHashfullPermille() const;
@@ -125,6 +125,8 @@ private:
     bool shouldStop();
 
     std::atomic<bool> stopSearch;
+    long long totalNodes = 0;
+    long long leafNodes = 0;
     std::chrono::steady_clock::time_point searchStart;
     int timeLimitMs = 1000;  // default: 5 seconds per move
     long long nodeLimit = 0;

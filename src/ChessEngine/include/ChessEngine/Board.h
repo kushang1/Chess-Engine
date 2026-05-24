@@ -46,7 +46,9 @@ public:
         return pieceCount[p];
     }
 
-    Piece pieceAt(int sq) const;
+    inline Piece pieceAt(int sq) const {
+        return (sq >= 0 && sq < 64) ? squareBoard[sq] : EMPTY;
+    }
     void rebuildPieceLists();
     int zobristEnPassantFile() const;
 

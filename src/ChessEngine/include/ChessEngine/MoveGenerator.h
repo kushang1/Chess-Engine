@@ -76,9 +76,14 @@ public:
     std::vector<Move> generateLegalMoves(board& Board);
     void generatePseudoLegalMoves(board& Board, MoveList& moves);
     void generateLegalMoves(board& Board, MoveList& moves);
+    void generateLegalMoves(board& Board, MoveList& moves, int kingSq, Bitboard checkers);
     void generateQuiescenceMoves(board& Board, MoveList& moves);
+    void generateQuiescenceMoves(board& Board, MoveList& moves, int kingSq, Bitboard checkers);
+    void generateQuiescenceMoves(board& Board, MoveList& moves, int kingSq, Bitboard checkers,
+        bool includeQuietChecks);
     int countLegalMoves(board& Board);
 
+    Bitboard attackersToSquare(const board& Board, int sq, bool byWhite, Bitboard occ);
     bool isSquareAttacked(const board& Board, int sq, bool byWhite);
     int findKing(const board& Board, bool white);
     bool isKinginCheck(const board& Board, bool white);

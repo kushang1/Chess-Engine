@@ -18,10 +18,11 @@ struct GenerationContext {
     Bitboard checkMask = FULL_MASK;
     Bitboard pinned = 0;
     int checkerCount = 0;
-    std::array<Bitboard, 64> pinMasks{};
+    Bitboard pinMasks[64];
 };
 
-void generateMoves(board& b, MoveList& moves, bool legalOnly);
+void generateMoves(board& b, MoveList& moves, bool legalOnly,
+    int knownKingSq = -2, Bitboard knownCheckers = 0, bool hasKnownCheckers = false);
 
 #ifdef ENABLE_ENGINE_PROFILING
 void profileLegalMovegenContext() {
@@ -193,10 +194,11 @@ void computePins(const board& b, GenerationContext& ctx) {
     }
 }
 
-GenerationContext buildContext(const board& b, bool legalOnly) {
+GenerationContext buildContext(const board& b, bool legalOnly,
+    int knownKingSq = -2, Bitboard knownCheckers = 0, bool hasKnownCheckers = false) {
     GenerationContext ctx;
     ctx.whiteToMove = b.isWhiteTurn;
-    ctx.kingSq = b.kingSquare(ctx.whiteToMove);
+    ctx.kingSq = knownKingSq != -2 ? knownKingSq : b.kingSquare(ctx.whiteToMove);
     ctx.usOcc = b.occupancy(ctx.whiteToMove);
     ctx.themOcc = b.occupancy(!ctx.whiteToMove);
     ctx.occ = b.occupied;
@@ -205,7 +207,9 @@ GenerationContext buildContext(const board& b, bool legalOnly) {
         return ctx;
     }
 
-    ctx.checkers = attackersTo(b, ctx.kingSq, !ctx.whiteToMove, ctx.occ);
+    ctx.checkers = hasKnownCheckers
+        ? knownCheckers
+        : attackersTo(b, ctx.kingSq, !ctx.whiteToMove, ctx.occ);
     ctx.checkerCount = Bitboards::popcount(ctx.checkers);
 
     if (ctx.checkerCount == 1) {
@@ -242,7 +246,8 @@ inline void addPromotionMoves(MoveList& moves, const board& b, int from, int to,
     const Piece* promos = (pawn == WP) ? whitePromos : blackPromos;
     int castleRights = updatedCastleRights(b.castleRights, pawn, from, captured, to);
 
-    for (Piece promo : std::array<Piece, 4>{promos[0], promos[1], promos[2], promos[3]}) {
+    for (int i = 0; i < 4; ++i) {
+        Piece promo = promos[i];
         moves.emplace_back(from, to, pawn, captured, castleRights);
         moves.back().wasPromotion = true;
         moves.back().promotedTo = promo;
@@ -513,7 +518,8 @@ bool quietMoveGivesCheck(const board& b, const GenerationContext& ctx, Piece mov
     return (Bitboards::rookAttacks(enemyKingSq, occAfter) & discoveredRooks) != 0;
 }
 
-void generateQuiescencePawnMoves(board& b, MoveList& moves, const GenerationContext& ctx) {
+void generateQuiescencePawnMoves(board& b, MoveList& moves, const GenerationContext& ctx,
+    bool includeQuietChecks) {
     Piece pawn = pawnPiece(ctx.whiteToMove);
     Bitboard pawns = b.pieces(pawn);
 
@@ -531,12 +537,12 @@ void generateQuiescencePawnMoves(board& b, MoveList& moves, const GenerationCont
                 if (promotion) {
                     addPromotionMoves(moves, b, from, oneStep, pawn, EMPTY);
                 }
-                else if (quietMoveGivesCheck(b, ctx, pawn, from, oneStep)) {
+                else if (includeQuietChecks && quietMoveGivesCheck(b, ctx, pawn, from, oneStep)) {
                     addQuietOrCapture(moves, b, from, oneStep, pawn, EMPTY);
                 }
 
                 bool startRank = ctx.whiteToMove ? (row == 6) : (row == 1);
-                if (!promotion && startRank) {
+                if (includeQuietChecks && !promotion && startRank) {
                     int twoStep = ctx.whiteToMove ? (from - 16) : (from + 16);
                     Bitboard twoMask = Bitboards::bit(twoStep);
                     if ((ctx.occ & twoMask) == 0 &&
@@ -570,7 +576,8 @@ void generateQuiescencePawnMoves(board& b, MoveList& moves, const GenerationCont
     }
 }
 
-void generateQuiescenceKnightMoves(const board& b, MoveList& moves, const GenerationContext& ctx) {
+void generateQuiescenceKnightMoves(const board& b, MoveList& moves, const GenerationContext& ctx,
+    bool includeQuietChecks) {
     Piece knight = knightPiece(ctx.whiteToMove);
     Bitboard knights = b.pieces(knight) & ~ctx.pinned;
 
@@ -583,18 +590,21 @@ void generateQuiescenceKnightMoves(const board& b, MoveList& moves, const Genera
             addQuietOrCapture(moves, b, from, to, knight, b.pieceAt(to));
         }
 
-        Bitboard quiets = targets & ~ctx.occ;
-        while (quiets) {
-            int to = Bitboards::poplsb(quiets);
-            if (quietMoveGivesCheck(b, ctx, knight, from, to)) {
-                addQuietOrCapture(moves, b, from, to, knight, EMPTY);
+        if (includeQuietChecks) {
+            Bitboard quiets = targets & ~ctx.occ;
+            while (quiets) {
+                int to = Bitboards::poplsb(quiets);
+                if (quietMoveGivesCheck(b, ctx, knight, from, to)) {
+                    addQuietOrCapture(moves, b, from, to, knight, EMPTY);
+                }
             }
         }
     }
 }
 
 template <Bitboard(*AttackFn)(int, Bitboard)>
-void generateQuiescenceSlidingMoves(const board& b, MoveList& moves, const GenerationContext& ctx, Piece piece) {
+void generateQuiescenceSlidingMoves(const board& b, MoveList& moves, const GenerationContext& ctx,
+    Piece piece, bool includeQuietChecks) {
     Bitboard pieces = b.pieces(piece);
 
     while (pieces) {
@@ -611,17 +621,20 @@ void generateQuiescenceSlidingMoves(const board& b, MoveList& moves, const Gener
             addQuietOrCapture(moves, b, from, to, piece, b.pieceAt(to));
         }
 
-        Bitboard quiets = targets & ~ctx.occ;
-        while (quiets) {
-            int to = Bitboards::poplsb(quiets);
-            if (quietMoveGivesCheck(b, ctx, piece, from, to)) {
-                addQuietOrCapture(moves, b, from, to, piece, EMPTY);
+        if (includeQuietChecks) {
+            Bitboard quiets = targets & ~ctx.occ;
+            while (quiets) {
+                int to = Bitboards::poplsb(quiets);
+                if (quietMoveGivesCheck(b, ctx, piece, from, to)) {
+                    addQuietOrCapture(moves, b, from, to, piece, EMPTY);
+                }
             }
         }
     }
 }
 
-void generateQuiescenceKingMoves(const board& b, MoveList& moves, const GenerationContext& ctx) {
+void generateQuiescenceKingMoves(const board& b, MoveList& moves, const GenerationContext& ctx,
+    bool includeQuietChecks) {
     Bitboard targets = Bitboards::KingAttacks[ctx.kingSq] & ~ctx.usOcc;
 
     while (targets) {
@@ -631,16 +644,19 @@ void generateQuiescenceKingMoves(const board& b, MoveList& moves, const Generati
         }
 
         Piece captured = ((ctx.themOcc & Bitboards::bit(to)) != 0) ? b.pieceAt(to) : EMPTY;
-        if (captured != EMPTY || quietMoveGivesCheck(b, ctx, kingPiece(ctx.whiteToMove), ctx.kingSq, to)) {
+        if (captured != EMPTY ||
+            (includeQuietChecks && quietMoveGivesCheck(b, ctx, kingPiece(ctx.whiteToMove), ctx.kingSq, to))) {
             addQuietOrCapture(moves, b, ctx.kingSq, to, kingPiece(ctx.whiteToMove), captured);
         }
     }
 }
 
-void generateQuiescenceMoveList(board& b, MoveList& moves) {
+void generateQuiescenceMoveList(board& b, MoveList& moves,
+    int knownKingSq = -2, Bitboard knownCheckers = 0, bool hasKnownCheckers = false,
+    bool includeQuietChecks = true) {
     moves.clear();
 
-    GenerationContext ctx = buildContext(b, true);
+    GenerationContext ctx = buildContext(b, true, knownKingSq, knownCheckers, hasKnownCheckers);
     if (ctx.kingSq == -1) {
         return;
     }
@@ -650,12 +666,15 @@ void generateQuiescenceMoveList(board& b, MoveList& moves) {
         return;
     }
 
-    generateQuiescenceKingMoves(b, moves, ctx);
-    generateQuiescencePawnMoves(b, moves, ctx);
-    generateQuiescenceKnightMoves(b, moves, ctx);
-    generateQuiescenceSlidingMoves<Bitboards::bishopAttacks>(b, moves, ctx, bishopPiece(ctx.whiteToMove));
-    generateQuiescenceSlidingMoves<Bitboards::rookAttacks>(b, moves, ctx, rookPiece(ctx.whiteToMove));
-    generateQuiescenceSlidingMoves<Bitboards::queenAttacks>(b, moves, ctx, queenPiece(ctx.whiteToMove));
+    generateQuiescenceKingMoves(b, moves, ctx, includeQuietChecks);
+    generateQuiescencePawnMoves(b, moves, ctx, includeQuietChecks);
+    generateQuiescenceKnightMoves(b, moves, ctx, includeQuietChecks);
+    generateQuiescenceSlidingMoves<Bitboards::bishopAttacks>(
+        b, moves, ctx, bishopPiece(ctx.whiteToMove), includeQuietChecks);
+    generateQuiescenceSlidingMoves<Bitboards::rookAttacks>(
+        b, moves, ctx, rookPiece(ctx.whiteToMove), includeQuietChecks);
+    generateQuiescenceSlidingMoves<Bitboards::queenAttacks>(
+        b, moves, ctx, queenPiece(ctx.whiteToMove), includeQuietChecks);
 }
 
 int countEnPassant(board& b, const GenerationContext& ctx, int from, bool legalOnly) {
@@ -865,10 +884,11 @@ int countMoves(board& b, bool legalOnly) {
     return count;
 }
 
-void generateMoves(board& b, MoveList& moves, bool legalOnly) {
+void generateMoves(board& b, MoveList& moves, bool legalOnly,
+    int knownKingSq, Bitboard knownCheckers, bool hasKnownCheckers) {
     moves.clear();
 
-    GenerationContext ctx = buildContext(b, legalOnly);
+    GenerationContext ctx = buildContext(b, legalOnly, knownKingSq, knownCheckers, hasKnownCheckers);
     if (ctx.kingSq == -1) {
         return;
     }
@@ -934,6 +954,17 @@ void MoveGenerator::generateLegalMoves(board& Board, MoveList& moves) {
     PROFILE_ADD(::Profiler::GeneratedLegalMovesTotal, moves.count);
 }
 
+void MoveGenerator::generateLegalMoves(board& Board, MoveList& moves, int kingSq, Bitboard checkers) {
+    PROFILE_INC(::Profiler::LegalMovegenCalls);
+    PROFILE_TIMER(::Profiler::LegalMovegenTime);
+#ifdef ENABLE_ENGINE_PROFILING
+    profileLegalMovegenContext();
+#endif
+
+    generateMoves(Board, moves, true, kingSq, checkers, true);
+    PROFILE_ADD(::Profiler::GeneratedLegalMovesTotal, moves.count);
+}
+
 void MoveGenerator::generateQuiescenceMoves(board& Board, MoveList& moves) {
     PROFILE_INC(::Profiler::QMovegenCalls);
     PROFILE_TIMER(::Profiler::QMovegenTime);
@@ -945,12 +976,39 @@ void MoveGenerator::generateQuiescenceMoves(board& Board, MoveList& moves) {
     PROFILE_ADD(::Profiler::GeneratedQMovesTotal, moves.count);
 }
 
+void MoveGenerator::generateQuiescenceMoves(board& Board, MoveList& moves, int kingSq, Bitboard checkers) {
+    PROFILE_INC(::Profiler::QMovegenCalls);
+    PROFILE_TIMER(::Profiler::QMovegenTime);
+#ifdef ENABLE_ENGINE_PROFILING
+    profileQMovegenContext();
+#endif
+
+    generateQuiescenceMoveList(Board, moves, kingSq, checkers, true);
+    PROFILE_ADD(::Profiler::GeneratedQMovesTotal, moves.count);
+}
+
+void MoveGenerator::generateQuiescenceMoves(board& Board, MoveList& moves, int kingSq, Bitboard checkers,
+    bool includeQuietChecks) {
+    PROFILE_INC(::Profiler::QMovegenCalls);
+    PROFILE_TIMER(::Profiler::QMovegenTime);
+#ifdef ENABLE_ENGINE_PROFILING
+    profileQMovegenContext();
+#endif
+
+    generateQuiescenceMoveList(Board, moves, kingSq, checkers, true, includeQuietChecks);
+    PROFILE_ADD(::Profiler::GeneratedQMovesTotal, moves.count);
+}
+
 int MoveGenerator::countLegalMoves(board& Board) {
     PROFILE_INC(::Profiler::CountLegalMoveCalls);
     PROFILE_TIMER(::Profiler::CountLegalMoveTime);
 
     int count = countMoves(Board, true);
     return count;
+}
+
+Bitboard MoveGenerator::attackersToSquare(const board& Board, int sq, bool byWhite, Bitboard occ) {
+    return attackersTo(Board, sq, byWhite, occ);
 }
 
 bool MoveGenerator::isSquareAttacked(const board& Board, int sq, bool byWhite) {

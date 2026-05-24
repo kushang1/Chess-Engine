@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -24,10 +25,6 @@
 #include <io.h>
 #include <windows.h>
 #endif
-
-
-std::atomic<long long> leafNodes{ 0 };
-std::atomic<long long> totalNodes{ 0 };
 
 
 static const int MATE_SCORE = 2000000000;       // same as your INF
@@ -62,13 +59,11 @@ std::mt19937_64& bookRng()
 
 int promotionKind(Piece piece)
 {
-	switch (piece) {
-	case WQ: case BQ: return 1;
-	case WR: case BR: return 2;
-	case WB: case BB: return 3;
-	case WN: case BN: return 4;
-	default: return 0;
-	}
+	static constexpr int kinds[13] = {
+		0, 1, 2, 0, 4, 0, 3,
+		   1, 2, 0, 4, 0, 3
+	};
+	return kinds[static_cast<int>(piece)];
 }
 
 bool sameMoveIdentity(const Move& lhs, const Move& rhs)
@@ -81,6 +76,23 @@ bool sameMoveIdentity(const Move& lhs, const Move& rhs)
 	}
 	return !lhs.wasPromotion ||
 		promotionKind(lhs.promotedTo) == promotionKind(rhs.promotedTo);
+}
+
+bool isRepeatedPosition(const std::vector<uint64_t>& history, uint64_t key)
+{
+	if (history.size() < 2) {
+		return false;
+	}
+
+	for (std::size_t i = history.size() - 2;; i -= 2) {
+		if (history[i] == key) {
+			return true;
+		}
+		if (i < 2) {
+			break;
+		}
+	}
+	return false;
 }
 
 bool findLegalEquivalent(const std::vector<Move>& legalMoves, const Move& candidate, Move& legalMove)
@@ -164,12 +176,11 @@ void writeUciInfoLine(const std::string& line)
 }
 
 void emitCompletedDepthInfo(int depth, int score, const Move& bestMove,
-	std::chrono::steady_clock::time_point searchStart)
+	long long nodes, std::chrono::steady_clock::time_point searchStart)
 {
 	auto now = std::chrono::steady_clock::now();
 	long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
 		now - searchStart).count();
-	long long nodes = totalNodes.load(std::memory_order_relaxed);
 	long long nps = elapsedMs > 0 ? (nodes * 1000LL) / elapsedMs : 0;
 
 	std::string line;
@@ -384,8 +395,8 @@ void Engine::initializeExternalData()
 
 void Engine::resetSearchStats()
 {
-	totalNodes.store(0, std::memory_order_relaxed);
-	leafNodes.store(0, std::memory_order_relaxed);
+	totalNodes = 0;
+	leafNodes = 0;
 }
 
 void Engine::setTimeLimitMs(int milliseconds)
@@ -438,12 +449,12 @@ void Engine::requestStop()
 
 long long Engine::nodesSearched() const
 {
-	return totalNodes.load(std::memory_order_relaxed);
+	return totalNodes;
 }
 
 long long Engine::leafNodesSearched() const
 {
-	return leafNodes.load(std::memory_order_relaxed);
+	return leafNodes;
 }
 
 void Engine::clearTT()
@@ -574,7 +585,7 @@ int Engine::scoreFromTT(int16_t score, int ply) const
 	return static_cast<int>(score);
 }
 
-Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply) const
+Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply)
 {
 	TTProbeResult result;
 	if (tt == nullptr || ttClusterCount == 0) {
@@ -582,12 +593,12 @@ Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply) const
 	}
 
 	PROFILE_INC(::Profiler::TTProbes);
-	const TTCluster& cluster = tt[key & ttClusterMask];
+	TTCluster& cluster = tt[key & ttClusterMask];
 	const uint16_t verify = key16(key);
 	bool occupied = false;
 
 	for (int slot = 0; slot < 4; ++slot) {
-		const TTEntry& entry = cluster.entries[slot];
+		TTEntry& entry = cluster.entries[slot];
 		const TTBound bound = entryBound(entry);
 		if (bound == TTBound::Empty) {
 			continue;
@@ -626,6 +637,7 @@ Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply) const
 		if (result.hasStaticEval) {
 			result.staticEval = static_cast<int>(entry.staticEval);
 		}
+		setGenerationBound(entry, currentGeneration, bound);
 		return result;
 	}
 
@@ -672,7 +684,24 @@ void Engine::storeTT(uint64_t key, int depth, int score, TTBound bound,
 		target = empty != nullptr ? empty : replacement;
 	}
 
+	if (target != nullptr &&
+		entryBound(*target) != TTBound::Empty &&
+		target->key16 == verify &&
+		entryBound(*target) == TTBound::Exact &&
+		bound != TTBound::Exact &&
+		static_cast<int>(target->depth) > depth + 2) {
+		if (packedMove != 0) {
+			target->move16 = packedMove;
+		}
+		if (staticEval != TT_NO_STATIC_EVAL) {
+			target->staticEval = packStaticEval(staticEval);
+		}
+		setGenerationBound(*target, currentGeneration, entryBound(*target));
+		return;
+	}
+
 	const bool replacingOccupied = entryBound(*target) != TTBound::Empty;
+	const bool targetSameKey = replacingOccupied && target->key16 == verify;
 	const bool replacingDifferent = replacingOccupied &&
 		(target->key16 != verify || target->move16 != packedMove);
 
@@ -693,7 +722,7 @@ void Engine::storeTT(uint64_t key, int depth, int score, TTBound bound,
 	}
 
 	target->key16 = verify;
-	target->move16 = packedMove;
+	target->move16 = (packedMove != 0 || !targetSameKey) ? packedMove : target->move16;
 	target->score = scoreToTT(score, ply);
 	target->staticEval = packStaticEval(staticEval);
 	target->depth = static_cast<uint8_t>(std::clamp(depth, 0, 255));
@@ -719,13 +748,12 @@ bool Engine::shouldStop()
 	}
 
 	if (nodeLimit > 0 &&
-		totalNodes.load(std::memory_order_relaxed) >= nodeLimit) {
+		totalNodes >= nodeLimit) {
 		stopSearch.store(true, std::memory_order_relaxed);
 		return true;
 	}
 
-	long long nodes = totalNodes.load(std::memory_order_relaxed);
-	if ((nodes & 0x0FFF) == 0) {
+	if ((totalNodes & 0x0FFF) == 0) {
 		auto now = std::chrono::steady_clock::now();
 		auto elapsedMs =
 			std::chrono::duration_cast<std::chrono::milliseconds>(now - searchStart).count();
@@ -743,17 +771,14 @@ static const int pieceValueSimple[13] = {
 	   9, 5, 1, 3, 100, 3
 };
 
+static const int pieceValueCpTable[13] = {
+	0, 900, 500, 100, 320, 20000, 330,
+	   900, 500, 100, 320, 20000, 330
+};
+
 static int pieceValueCp(Piece p)
 {
-	switch (p) {
-	case WP: case BP: return 100;
-	case WN: case BN: return 320;
-	case WB: case BB: return 330;
-	case WR: case BR: return 500;
-	case WQ: case BQ: return 900;
-	case WK: case BK: return 20000;
-	default: return 0;
-	}
+	return pieceValueCpTable[static_cast<int>(p)];
 }
 
 static int promotionGainCp(const Move& m)
@@ -1582,22 +1607,28 @@ static EvalScore evaluatePawns(const EvalContext& ctx)
 		whiteConnectedPassed = whitePassed & whiteConnected;
 		blackConnectedPassed = blackPassed & blackConnected;
 
-		for (int row = 0; row < 8; ++row) {
-			const int whiteAdvanced = 7 - row;
-			const int blackAdvanced = row;
-			const int whiteCount = Bitboards::popcount(whitePassed & RankMasks[row]);
-			const int blackCount = Bitboards::popcount(blackPassed & RankMasks[row]);
-			score.mg += whiteCount * passedPawnBonus[whiteAdvanced].mg;
-			score.eg += whiteCount * passedPawnBonus[whiteAdvanced].eg;
-			score.mg -= blackCount * passedPawnBonus[blackAdvanced].mg;
-			score.eg -= blackCount * passedPawnBonus[blackAdvanced].eg;
+		Bitboard passed = whitePassed;
+		while (passed != 0) {
+			const int sq = Bitboards::poplsb(passed);
+			const int advanced = 7 - (sq >> 3);
+			score.mg += passedPawnBonus[advanced].mg;
+			score.eg += passedPawnBonus[advanced].eg;
+			if ((whiteConnectedPassed & Bitboards::bit(sq)) != 0) {
+				score.mg += 10 + 2 * advanced;
+				score.eg += 22 + 5 * advanced;
+			}
+		}
 
-			const int whiteConnectedCount = Bitboards::popcount(whiteConnectedPassed & RankMasks[row]);
-			const int blackConnectedCount = Bitboards::popcount(blackConnectedPassed & RankMasks[row]);
-			score.mg += whiteConnectedCount * (10 + 2 * whiteAdvanced);
-			score.eg += whiteConnectedCount * (22 + 5 * whiteAdvanced);
-			score.mg -= blackConnectedCount * (10 + 2 * blackAdvanced);
-			score.eg -= blackConnectedCount * (22 + 5 * blackAdvanced);
+		passed = blackPassed;
+		while (passed != 0) {
+			const int sq = Bitboards::poplsb(passed);
+			const int advanced = sq >> 3;
+			score.mg -= passedPawnBonus[advanced].mg;
+			score.eg -= passedPawnBonus[advanced].eg;
+			if ((blackConnectedPassed & Bitboards::bit(sq)) != 0) {
+				score.mg -= 10 + 2 * advanced;
+				score.eg -= 22 + 5 * advanced;
+			}
 		}
 	}
 
@@ -2041,6 +2072,63 @@ static int evaluateLegacyPosition(const board& b)
 
 } // namespace
 
+namespace {
+
+constexpr int HistoryLimit = 400000;
+
+static int historyBonusForDepth(int depth)
+{
+	return std::min(32000, 256 * depth * depth);
+}
+
+static void updateHistoryEntry(int& entry, int bonus)
+{
+	bonus = std::clamp(bonus, -HistoryLimit, HistoryLimit);
+	const int absBonus = bonus < 0 ? -bonus : bonus;
+	const int64_t adjusted = static_cast<int64_t>(entry) + bonus -
+		(static_cast<int64_t>(entry) * absBonus) / HistoryLimit;
+	entry = static_cast<int>(std::clamp<int64_t>(adjusted, -HistoryLimit, HistoryLimit));
+}
+
+static int lmrReductionForMove(int depth, int searchedMoves, int historyScore,
+	bool pvNode, bool isKiller)
+{
+	const int moveNumber = searchedMoves + 1;
+	if (depth < 3 || moveNumber < 3) {
+		return 0;
+	}
+
+	int reduction = 1;
+	if (depth >= 6) {
+		++reduction;
+	}
+	if (depth >= 10) {
+		++reduction;
+	}
+	if (moveNumber >= 6) {
+		++reduction;
+	}
+	if (moveNumber >= 12) {
+		++reduction;
+	}
+	if (historyScore < -12000) {
+		++reduction;
+	}
+	else if (historyScore > 60000) {
+		--reduction;
+	}
+	if (pvNode) {
+		--reduction;
+	}
+	if (isKiller) {
+		--reduction;
+	}
+
+	return std::clamp(reduction, 0, depth - 2);
+}
+
+} // namespace
+
 // ==========================================================
 // MOVE ORDERING (CAPTURE + KILLER + HISTORY)
 // ==========================================================
@@ -2048,8 +2136,6 @@ int Engine::scoreMove(const Move& m, const board& b, int ply,
 	bool haveTTMove, const Move& ttMove)
 {
 	PROFILE_INC(::Profiler::ScoreMoveCalls);
-
-	ply = std::clamp(ply, 0, MAX_DEPTH - 1);
 
 	// 1. TT move first, even when the stored entry is shallow.
 	if (haveTTMove && sameMoveIdentity(m, ttMove)) {
@@ -2086,7 +2172,7 @@ int Engine::scoreMove(const Move& m, const board& b, int ply,
 	// 4. Quiet moves use side-aware history scores.
 	int side = b.isWhiteTurn ? 0 : 1;
 	PROFILE_INC(::Profiler::HistoryScored);
-	return std::clamp(historyHeuristic[side][m.from][m.to], -200000, 350000);
+	return std::clamp(historyHeuristic[side][m.from][m.to], -HistoryLimit, HistoryLimit);
 }
 
 // ==========================================================
@@ -2371,44 +2457,45 @@ Move Engine::findBestMove(board& b, int maxDepth,
 			}
 
 			Move rm = rootMoves[i];
-			board local = b;
-			std::vector<uint64_t> localRepHistory = repHistory;
-			local.makeMove(rm);
+			Unmove undo = b.makeMove(rm);
 
 			const int childDepth = depth - 1;
 			int childScore = 0;
 			int score = -INF;
+			bool aborted = false;
 
 			if (firstMove) {
-				childScore = search(local, childDepth, -rootBeta, -alpha,
-					1, localRepHistory, true, 0);
-				if (isSearchAborted(childScore)) {
-					entry.aborted = true;
-					result.stopped = true;
-					break;
-				}
-				score = -childScore;
-			}
-			else {
-				childScore = search(local, childDepth, -alpha - 1, -alpha,
-					1, localRepHistory, false, 0);
-				if (isSearchAborted(childScore)) {
-					entry.aborted = true;
-					result.stopped = true;
-					break;
-				}
-				score = -childScore;
-
-				if (score > alpha && score < rootBeta) {
-					childScore = search(local, childDepth, -rootBeta, -alpha,
-						1, localRepHistory, true, 0);
-					if (isSearchAborted(childScore)) {
-						entry.aborted = true;
-						result.stopped = true;
-						break;
-					}
+				childScore = search(b, childDepth, -rootBeta, -alpha,
+					1, repHistory, true, 0);
+				aborted = isSearchAborted(childScore);
+				if (!aborted) {
 					score = -childScore;
 				}
+			}
+			else {
+				childScore = search(b, childDepth, -alpha - 1, -alpha,
+					1, repHistory, false, 0);
+				aborted = isSearchAborted(childScore);
+				if (!aborted) {
+					score = -childScore;
+				}
+
+				if (!aborted && score > alpha && score < rootBeta) {
+					childScore = search(b, childDepth, -rootBeta, -alpha,
+						1, repHistory, true, 0);
+					aborted = isSearchAborted(childScore);
+					if (!aborted) {
+						score = -childScore;
+					}
+				}
+			}
+
+			b.unmakeMove(rm, undo);
+
+			if (aborted) {
+				entry.aborted = true;
+				result.stopped = true;
+				break;
 			}
 
 			if (shouldStop()) {
@@ -2529,7 +2616,7 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 			if (emitUciInfo) {
 				// Emit only after a fully completed root depth; never from node loops.
-				emitCompletedDepthInfo(depth, bestFullScore, bestFullMove, searchStart);
+				emitCompletedDepthInfo(depth, bestFullScore, bestFullMove, totalNodes, searchStart);
 			}
 			continue;
 		}
@@ -2597,10 +2684,8 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	uint64_t key = computeHash(b);
 
 	// check only same-side-to-move positions
-	for (auto it = repHistory.rbegin(); it != repHistory.rend(); ++it) {
-		if (*it == key) {
-			return 0;   // repetition ? draw score
-		}
+	if (isRepeatedPosition(repHistory, key)) {
+		return 0;   // repetition draw score
 	}
 
 	// Leaf ? quiescence search
@@ -2670,11 +2755,13 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	// -------------------------------
 	int kingSq = -1;
 	bool inCheck = false;
+	Bitboard checkers = 0;
 	{
 		PROFILE_INC(::Profiler::InCheckCalls);
 		PROFILE_TIMER(::Profiler::InCheckTime);
-		kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
-		inCheck = moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
+		kingSq = b.kingSquare(b.isWhiteTurn);
+		checkers = moveGenerator->attackersToSquare(b, kingSq, !b.isWhiteTurn, b.occupied);
+		inCheck = checkers != 0;
 	}
 
 
@@ -2755,7 +2842,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	MoveList moves;
 	{
 		PROFILE_MOVEGEN_CONTEXT(Search);
-		moveGenerator->generateLegalMoves(b, moves);
+		moveGenerator->generateLegalMoves(b, moves, kingSq, checkers);
 	}
 
 	// No legal moves ? checkmate or stalemate
@@ -2792,10 +2879,18 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 	int moveIndex = 0;
 	int searchedMoves = 0;
 	bool firstMove = true;
+	Move searchedQuietMoves[MoveList::MAX_MOVES];
+	int searchedQuietCount = 0;
 
 	for (int orderedIndex = 0; orderedIndex < moves.count; ++orderedIndex) {
 		selectBestScoredMove(moveData, scores, orderedIndex, moves.count);
 		Move& move = moveData[orderedIndex];
+
+		const bool quietMove = isQuietMove(move);
+		const int movingSide = b.isWhiteTurn ? 0 : 1;
+		const int historyScore = quietMove
+			? historyHeuristic[movingSide][move.from][move.to]
+			: 0;
 
 		Unmove u = b.makeMove(move);
 
@@ -2810,8 +2905,8 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		{
 			PROFILE_INC(::Profiler::InCheckCalls);
 			PROFILE_TIMER(::Profiler::InCheckTime);
-			oppKingSq = moveGenerator->findKing(b, b.isWhiteTurn);
-			givesCheck = moveGenerator->isSquareAttacked(b, oppKingSq, !b.isWhiteTurn);
+			oppKingSq = b.kingSquare(b.isWhiteTurn);
+			givesCheck = moveGenerator->attackersToSquare(b, oppKingSq, !b.isWhiteTurn, b.occupied) != 0;
 		}
 
 		bool isTTMove = false;
@@ -2853,7 +2948,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 			searchedMoves > 0 &&
 			!isTTMove &&
 			!isKiller &&
-			historyHeuristic[b.isWhiteTurn ? 0 : 1][move.from][move.to] < 12000)
+			historyScore < 12000)
 		{
 			PROFILE_INC(::Profiler::LmpPrunes);
 			// LMP is forward pruning. Once a legal move is skipped, this node
@@ -2868,36 +2963,27 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 		bool usePvs = !firstMove && !inCheck && depth > 1;
 
 		// ---------------------------------------
-		// LMR CONDITIONS:
-		//  - depth >= 3
-		//  - moveIndex >= 3 (late move)
-		//  - quiet move (no capture)
-		//  - not in check already
-		//  - move itself does NOT give check
-		// ---------------------------------------
+		// LMR: reduce late, quiet, tactically unforcing moves. PV/killer/high-history
+		// moves are either unreduced or reduced less, and any alpha raise is
+		// re-searched at full depth.
 		PROFILE_INC(::Profiler::LmrAttempts);
-		if (newDepth > 0 &&
-			depth >= 3 &&
-			moveIndex >= 3 &&
-			isQuietMove(move) &&
-			!pvNode &&
+		int reduction = 0;
+		if (newDepth > 1 &&
+			quietMove &&
 			!inCheck &&
 			!givesCheck &&
-			!isTTMove &&
-			!isKiller)
+			!isTTMove)
+		{
+			reduction = std::min(
+				lmrReductionForMove(depth, searchedMoves, historyScore, pvNode, isKiller),
+				newDepth - 1);
+		}
+
+		if (reduction > 0)
 		{
 			PROFILE_INC(::Profiler::LmrApplied);
-			int R = 1;
-			if (depth >= 6 && moveIndex >= 6) {
-				++R;
-			}
-			if (historyHeuristic[b.isWhiteTurn ? 0 : 1][move.from][move.to] < 0) {
-				++R;
-			}
-			R = std::min(R, newDepth - 1);
-
 			// Reduced-depth search with null window
-			int childScore = search(b, newDepth - R,
+			int childScore = search(b, newDepth - reduction,
 				-alpha - 1, -alpha,
 				ply + 1, repHistory, false, extensionCount + extension);
 			if (isSearchAborted(childScore)) {
@@ -3000,17 +3086,26 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 			}
 			PROFILE_INC(profileCutoffMoveIndexCounter(moveIndex));
 #endif
-			if (isQuietMove(move)) {
+			if (quietMove) {
 				// Quiet beta cutoffs update killer and side-aware history tables.
 				if (!sameMoveIdentity(killerMoves[tablePly][0], move)) {
 					killerMoves[tablePly][1] = killerMoves[tablePly][0];
 					killerMoves[tablePly][0] = move;
 				}
-				int side = b.isWhiteTurn ? 0 : 1;
-				historyHeuristic[side][move.from][move.to] =
-					std::min(1000000, historyHeuristic[side][move.from][move.to] + depth * depth);
+				const int bonus = historyBonusForDepth(depth);
+				updateHistoryEntry(historyHeuristic[movingSide][move.from][move.to], bonus);
+				for (int i = 0; i < searchedQuietCount; ++i) {
+					const Move& failedQuiet = searchedQuietMoves[i];
+					updateHistoryEntry(
+						historyHeuristic[movingSide][failedQuiet.from][failedQuiet.to],
+						-bonus);
+				}
 			}
 			break;
+		}
+
+		if (quietMove && searchedQuietCount < MoveList::MAX_MOVES) {
+			searchedQuietMoves[searchedQuietCount++] = move;
 		}
 
 		moveIndex++;
@@ -3065,6 +3160,7 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	constexpr int MaxQSearchPly = 24;
 	constexpr int MaxQuietCheckQply = 4;
 	constexpr int DeltaMargin = 150;
+	constexpr int QuietCheckAlphaMargin = 180;
 
 	if (shouldStop()) {
 		return SEARCH_ABORTED;
@@ -3075,21 +3171,20 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	}
 
 	uint64_t key = computeHash(b);
-	for (auto it = repHistory.rbegin(); it != repHistory.rend(); ++it) {
-		if (*it == key) {
-			return 0;
-		}
+	if (isRepeatedPosition(repHistory, key)) {
+		return 0;
 	}
 	RepetitionFrame repetitionFrame(repHistory, key);
 
 	int kingSq = -1;
 	bool inCheck = false;
+	Bitboard checkers = 0;
 	{
 		PROFILE_INC(::Profiler::InCheckCalls);
 		PROFILE_TIMER(::Profiler::InCheckTime);
-		kingSq = moveGenerator->findKing(b, b.isWhiteTurn);
-		inCheck = kingSq != -1 &&
-			moveGenerator->isSquareAttacked(b, kingSq, !b.isWhiteTurn);
+		kingSq = b.kingSquare(b.isWhiteTurn);
+		checkers = moveGenerator->attackersToSquare(b, kingSq, !b.isWhiteTurn, b.occupied);
+		inCheck = checkers != 0;
 	}
 #ifdef ENABLE_ENGINE_PROFILING
 	if (inCheck) {
@@ -3126,9 +3221,11 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	}
 
 	MoveList moves;
+	const bool includeQuietChecks =
+		inCheck || (qply < MaxQuietCheckQply && standPat + QuietCheckAlphaMargin >= alpha);
 	{
 		PROFILE_MOVEGEN_CONTEXT(Qsearch);
-		moveGenerator->generateQuiescenceMoves(b, moves);
+		moveGenerator->generateQuiescenceMoves(b, moves, kingSq, checkers, includeQuietChecks);
 	}
 #ifdef ENABLE_ENGINE_PROFILING
 	PROFILE_ADD(::Profiler::QGeneratedMovesTotal, moves.count);
@@ -3162,6 +3259,7 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	int scores[MoveList::MAX_MOVES];
 	Move qMoves[MoveList::MAX_MOVES];
 	int searchCount = 0;
+	const int tablePly = std::clamp(ply, 0, MAX_DEPTH - 1);
 
 	if (inCheck) {
 		// Stand-pat is illegal while in check; search every legal evasion.
@@ -3170,7 +3268,7 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 		PROFILE_SEE_CONTEXT(QsearchMoveOrdering);
 		for (int i = 0; i < searchCount; ++i) {
 			qMoves[i] = moves.data()[i];
-			scores[i] = scoreMove(qMoves[i], b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move());
+			scores[i] = scoreMove(qMoves[i], b, tablePly, false, Move());
 		}
 	}
 	else {
@@ -3179,7 +3277,7 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 			bool isCapture = (m.captured != EMPTY) || m.wasEnPassant;
 			bool tactical = isCapture || m.wasPromotion;
 			if (!tactical) {
-				if (qply >= MaxQuietCheckQply) {
+				if (!includeQuietChecks) {
 					PROFILE_INC(::Profiler::QMovesSkippedNotCaptureOrPromotionOrCheck);
 					continue;
 				}
@@ -3188,7 +3286,7 @@ int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 				{
 					PROFILE_SEE_CONTEXT(QsearchMoveOrdering);
 					scores[searchCount] = 250000 +
-						std::clamp(scoreMove(m, b, std::clamp(ply, 0, MAX_DEPTH - 1), false, Move()),
+						std::clamp(scoreMove(m, b, tablePly, false, Move()),
 							-50000, 50000);
 				}
 				++searchCount;
