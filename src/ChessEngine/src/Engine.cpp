@@ -357,22 +357,170 @@ private:
 
 } // namespace
 
+static_assert(sizeof(SharedTranspositionTable::Entry) == 16,
+	"TT entry must stay 16 bytes");
+static_assert(sizeof(SharedTranspositionTable::Cluster) == 64,
+	"TT cluster must stay one cache line");
+static_assert(alignof(SharedTranspositionTable::Cluster) == 64,
+	"TT cluster must be cache-line aligned");
 
-Engine::Engine() : stopSearch(false) {
+SharedTranspositionTable::SharedTranspositionTable()
+{
+	resize(DefaultHashMb);
+}
+
+SharedTranspositionTable::~SharedTranspositionTable()
+{
+	delete[] table;
+}
+
+void SharedTranspositionTable::resize(int megabytes)
+{
+	megabytes = std::clamp(megabytes, MinHashMb, MaxHashMb);
+
+	const uint64_t bytes = static_cast<uint64_t>(megabytes) * 1024ULL * 1024ULL;
+	uint64_t clusters = floorPowerOfTwo(bytes / sizeof(Cluster));
+	if (clusters == 0) {
+		clusters = 1;
+	}
+
+	Cluster* newTable = new (std::nothrow) Cluster[clusters]();
+	if (newTable == nullptr) {
+		return;
+	}
+
+	delete[] table;
+	table = newTable;
+	count = clusters;
+	mask = clusters - 1;
+	used.store(0, std::memory_order_relaxed);
+	generation.store(0, std::memory_order_relaxed);
+}
+
+void SharedTranspositionTable::clear()
+{
+	if (table == nullptr || count == 0) {
+		return;
+	}
+
+	for (uint64_t cluster = 0; cluster < count; ++cluster) {
+		for (Entry& entry : table[cluster].entries) {
+			entry.data.store(0, std::memory_order_relaxed);
+			entry.keyXorData.store(0, std::memory_order_relaxed);
+		}
+	}
+	used.store(0, std::memory_order_relaxed);
+}
+
+uint8_t SharedTranspositionTable::newSearch()
+{
+	const unsigned previous = generation.fetch_add(1, std::memory_order_acq_rel);
+	return static_cast<uint8_t>((previous + 1U) & 0x3FU);
+}
+
+SharedTranspositionTable::Cluster* SharedTranspositionTable::clusters() const
+{
+	return table;
+}
+
+uint64_t SharedTranspositionTable::clusterCount() const
+{
+	return count;
+}
+
+uint64_t SharedTranspositionTable::clusterMask() const
+{
+	return mask;
+}
+
+uint64_t SharedTranspositionTable::usedEntries() const
+{
+	return used.load(std::memory_order_relaxed);
+}
+
+void SharedTranspositionTable::noteNewEntry()
+{
+	used.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SharedSearchControl::start(int milliseconds, long long nodeLimitValue)
+{
+	timeLimitMs = std::max(1, milliseconds);
+	nodeLimit = std::max(0LL, nodeLimitValue);
+	nodes.store(0, std::memory_order_relaxed);
+	stop.store(false, std::memory_order_release);
+	started = std::chrono::steady_clock::now();
+}
+
+void SharedSearchControl::clearStop()
+{
+	stop.store(false, std::memory_order_release);
+}
+
+void SharedSearchControl::requestStop()
+{
+	stop.store(true, std::memory_order_release);
+}
+
+bool SharedSearchControl::isStopRequested() const
+{
+	return stop.load(std::memory_order_acquire);
+}
+
+bool SharedSearchControl::shouldStop()
+{
+	if (stop.load(std::memory_order_acquire)) {
+		return true;
+	}
+
+	if (nodeLimit > 0 && nodes.load(std::memory_order_relaxed) >= nodeLimit) {
+		stop.store(true, std::memory_order_release);
+		return true;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		now - started).count();
+	if (elapsed >= timeLimitMs) {
+		stop.store(true, std::memory_order_release);
+		return true;
+	}
+
+	return false;
+}
+
+long long SharedSearchControl::countNode()
+{
+	const long long value = nodes.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (nodeLimit > 0 && value >= nodeLimit) {
+		stop.store(true, std::memory_order_release);
+	}
+	return value;
+}
+
+long long SharedSearchControl::nodesSearched() const
+{
+	return nodes.load(std::memory_order_relaxed);
+}
+
+std::chrono::steady_clock::time_point SharedSearchControl::startTime() const
+{
+	return started;
+}
+
+Engine::Engine() : tt(std::make_shared<SharedTranspositionTable>()), stopSearch(false) {
 	for (int ply = 0; ply < MAX_DEPTH; ++ply)
 		for (int slot = 0; slot < 2; ++slot)
 			killerMoves[ply][slot] = Move();  // invalid move
 
 	memset(historyHeuristic, 0, sizeof(historyHeuristic));
 
-	resizeTranspositionTable(DefaultHashMb);
 	initializeExternalData();
 
 }
 
 
 Engine::~Engine() {
-	delete[] tt;
 }
 
 void Engine::initializeExternalData()
@@ -414,37 +562,54 @@ void Engine::setHashSizeMb(int megabytes)
 	resizeTranspositionTable(megabytes);
 }
 
+void Engine::setSharedTranspositionTable(const std::shared_ptr<SharedTranspositionTable>& table)
+{
+	tt = table;
+}
+
+std::shared_ptr<SharedTranspositionTable> Engine::sharedTranspositionTable() const
+{
+	return tt;
+}
+
+void Engine::setSharedSearchControl(const std::shared_ptr<SharedSearchControl>& control)
+{
+	sharedControl = control;
+}
+
+void Engine::setWorkerId(int id)
+{
+	workerId = std::max(0, id);
+}
+
+void Engine::setEmitUciInfo(bool enabled)
+{
+	emitSearchInfo = enabled;
+}
+
 void Engine::resizeTranspositionTable(int megabytes)
 {
-	megabytes = std::clamp(megabytes, MinHashMb, MaxHashMb);
-
-	const uint64_t bytes = static_cast<uint64_t>(megabytes) * 1024ULL * 1024ULL;
-	uint64_t clusters = floorPowerOfTwo(bytes / sizeof(TTCluster));
-	if (clusters == 0) {
-		clusters = 1;
+	if (!tt) {
+		tt = std::make_shared<SharedTranspositionTable>();
 	}
-
-	TTCluster* newTable = new (std::nothrow) TTCluster[clusters]();
-	if (newTable == nullptr) {
-		return;
-	}
-
-	delete[] tt;
-	tt = newTable;
-	ttClusterCount = clusters;
-	ttClusterMask = clusters - 1;
-	ttUsedEntries = 0;
+	tt->resize(megabytes);
 	currentGeneration = 0;
 }
 
 void Engine::clearStop()
 {
 	stopSearch.store(false, std::memory_order_relaxed);
+	if (sharedControl) {
+		sharedControl->clearStop();
+	}
 }
 
 void Engine::requestStop()
 {
 	stopSearch.store(true, std::memory_order_relaxed);
+	if (sharedControl) {
+		sharedControl->requestStop();
+	}
 }
 
 long long Engine::nodesSearched() const
@@ -457,34 +622,64 @@ long long Engine::leafNodesSearched() const
 	return leafNodes;
 }
 
+int Engine::lastSearchScore() const
+{
+	return lastScore;
+}
+
+int Engine::lastSearchDepth() const
+{
+	return lastDepth;
+}
+
 void Engine::clearTT()
 {
-	if (tt == nullptr || ttClusterCount == 0) {
+	if (!tt) {
 		return;
 	}
-	std::memset(tt, 0, sizeof(TTCluster) * ttClusterCount);
-	ttUsedEntries = 0;
+	tt->clear();
 }
 
 void Engine::newSearch()
 {
-	currentGeneration = static_cast<uint8_t>((currentGeneration + 1) & 0x3F);
+	currentGeneration = tt ? tt->newSearch() :
+		static_cast<uint8_t>((currentGeneration + 1) & 0x3F);
 }
 
-uint8_t Engine::entryGeneration(const TTEntry& entry)
+uint8_t Engine::entryGeneration(const DecodedTTEntry& entry)
 {
 	return static_cast<uint8_t>(entry.generationBound >> 2);
 }
 
-Engine::TTBound Engine::entryBound(const TTEntry& entry)
+Engine::TTBound Engine::entryBound(const DecodedTTEntry& entry)
 {
 	return static_cast<TTBound>(entry.generationBound & 0x03);
 }
 
-void Engine::setGenerationBound(TTEntry& entry, uint8_t generation, TTBound bound)
+uint8_t Engine::makeGenerationBound(uint8_t generation, TTBound bound)
 {
-	entry.generationBound = static_cast<uint8_t>(
+	return static_cast<uint8_t>(
 		((generation & 0x3F) << 2) | (static_cast<uint8_t>(bound) & 0x03));
+}
+
+uint64_t Engine::packTTEntry(const DecodedTTEntry& entry)
+{
+	return static_cast<uint64_t>(entry.move16) |
+		(static_cast<uint64_t>(static_cast<uint16_t>(entry.score)) << 16) |
+		(static_cast<uint64_t>(static_cast<uint16_t>(entry.staticEval)) << 32) |
+		(static_cast<uint64_t>(entry.depth) << 48) |
+		(static_cast<uint64_t>(entry.generationBound) << 56);
+}
+
+Engine::DecodedTTEntry Engine::unpackTTEntry(uint64_t data)
+{
+	DecodedTTEntry entry;
+	entry.move16 = static_cast<uint16_t>(data & 0xFFFFULL);
+	entry.score = static_cast<int16_t>((data >> 16) & 0xFFFFULL);
+	entry.staticEval = static_cast<int16_t>((data >> 32) & 0xFFFFULL);
+	entry.depth = static_cast<uint8_t>((data >> 48) & 0xFFULL);
+	entry.generationBound = static_cast<uint8_t>((data >> 56) & 0xFFULL);
+	return entry;
 }
 
 uint8_t Engine::generationAge(uint8_t entryGen) const
@@ -492,16 +687,11 @@ uint8_t Engine::generationAge(uint8_t entryGen) const
 	return static_cast<uint8_t>((currentGeneration - entryGen) & 0x3F);
 }
 
-int Engine::replacementScore(const TTEntry& entry) const
+int Engine::replacementScore(const DecodedTTEntry& entry) const
 {
 	const int exactBonus = entryBound(entry) == TTBound::Exact ? 8 : 0;
 	const int agePenalty = static_cast<int>(generationAge(entryGeneration(entry))) * 4;
 	return static_cast<int>(entry.depth) + exactBonus - agePenalty;
-}
-
-uint16_t Engine::key16(uint64_t key) const
-{
-	return static_cast<uint16_t>(key >> 48);
 }
 
 uint16_t Engine::packMove(const Move& move) const
@@ -588,24 +778,34 @@ int Engine::scoreFromTT(int16_t score, int ply) const
 Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply)
 {
 	TTProbeResult result;
-	if (tt == nullptr || ttClusterCount == 0) {
+	if (!tt || tt->clusters() == nullptr || tt->clusterCount() == 0) {
 		return result;
 	}
 
 	PROFILE_INC(::Profiler::TTProbes);
-	TTCluster& cluster = tt[key & ttClusterMask];
-	const uint16_t verify = key16(key);
+	SharedTranspositionTable::Cluster& cluster =
+		tt->clusters()[key & tt->clusterMask()];
 	bool occupied = false;
 
 	for (int slot = 0; slot < 4; ++slot) {
-		TTEntry& entry = cluster.entries[slot];
-		const TTBound bound = entryBound(entry);
-		if (bound == TTBound::Empty) {
+		SharedTranspositionTable::Entry& slotEntry = cluster.entries[slot];
+		const uint64_t keyXorData =
+			slotEntry.keyXorData.load(std::memory_order_acquire);
+		const uint64_t data =
+			slotEntry.data.load(std::memory_order_acquire);
+
+		if (data == 0) {
 			continue;
 		}
 
 		occupied = true;
-		if (entry.key16 != verify) {
+		if ((keyXorData ^ data) != key) {
+			continue;
+		}
+
+		const DecodedTTEntry entry = unpackTTEntry(data);
+		const TTBound bound = entryBound(entry);
+		if (bound == TTBound::Empty) {
 			continue;
 		}
 
@@ -637,7 +837,6 @@ Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply)
 		if (result.hasStaticEval) {
 			result.staticEval = static_cast<int>(entry.staticEval);
 		}
-		setGenerationBound(entry, currentGeneration, bound);
 		return result;
 	}
 
@@ -651,65 +850,98 @@ Engine::TTProbeResult Engine::probeTT(uint64_t key, int ply)
 void Engine::storeTT(uint64_t key, int depth, int score, TTBound bound,
 	const Move& bestMove, int ply, int staticEval)
 {
-	if (tt == nullptr || ttClusterCount == 0 || bound == TTBound::Empty) {
+	if (!tt || tt->clusters() == nullptr || tt->clusterCount() == 0 ||
+		bound == TTBound::Empty) {
 		return;
 	}
 
-	TTCluster& cluster = tt[key & ttClusterMask];
-	const uint16_t verify = key16(key);
+	SharedTranspositionTable::Cluster& cluster =
+		tt->clusters()[key & tt->clusterMask()];
 	const uint16_t packedMove = packMove(bestMove);
 
-	TTEntry* target = nullptr;
-	TTEntry* empty = nullptr;
-	TTEntry* replacement = &cluster.entries[0];
-	int replacementValue = replacementScore(*replacement);
+	SharedTranspositionTable::Entry* target = nullptr;
+	SharedTranspositionTable::Entry* empty = nullptr;
+	SharedTranspositionTable::Entry* replacement = &cluster.entries[0];
+	DecodedTTEntry replacementEntry =
+		unpackTTEntry(replacement->data.load(std::memory_order_relaxed));
+	int replacementValue = replacementScore(replacementEntry);
+	DecodedTTEntry targetEntry;
+	bool targetHadEntry = false;
+	bool targetSameKey = false;
 
-	for (TTEntry& entry : cluster.entries) {
-		const TTBound entryType = entryBound(entry);
-		if (entryType != TTBound::Empty && entry.key16 == verify) {
-			target = &entry;
+	for (SharedTranspositionTable::Entry& slotEntry : cluster.entries) {
+		const uint64_t keyXorData =
+			slotEntry.keyXorData.load(std::memory_order_acquire);
+		const uint64_t data =
+			slotEntry.data.load(std::memory_order_acquire);
+		DecodedTTEntry entry = unpackTTEntry(data);
+		const TTBound entryType = data == 0 ? TTBound::Empty : entryBound(entry);
+		const bool sameKey = data != 0 && ((keyXorData ^ data) == key);
+		if (entryType != TTBound::Empty && sameKey) {
+			target = &slotEntry;
+			targetEntry = entry;
+			targetHadEntry = true;
+			targetSameKey = sameKey;
 			break;
 		}
 		if (entryType == TTBound::Empty && empty == nullptr) {
-			empty = &entry;
+			empty = &slotEntry;
 		}
 		const int value = replacementScore(entry);
 		if (value < replacementValue) {
 			replacementValue = value;
-			replacement = &entry;
+			replacement = &slotEntry;
+			replacementEntry = entry;
 		}
 	}
 
 	if (target == nullptr) {
 		target = empty != nullptr ? empty : replacement;
+		if (empty == nullptr) {
+			targetEntry = replacementEntry;
+			const uint64_t oldData = target->data.load(std::memory_order_acquire);
+			const uint64_t oldKeyXorData =
+				target->keyXorData.load(std::memory_order_acquire);
+			targetHadEntry = oldData != 0;
+			targetSameKey = oldData != 0 && ((oldKeyXorData ^ oldData) == key);
+		}
+		else {
+			targetEntry = DecodedTTEntry{};
+			targetHadEntry = false;
+			targetSameKey = false;
+		}
 	}
 
 	if (target != nullptr &&
-		entryBound(*target) != TTBound::Empty &&
-		target->key16 == verify &&
-		entryBound(*target) == TTBound::Exact &&
+		targetHadEntry &&
+		targetSameKey &&
+		entryBound(targetEntry) == TTBound::Exact &&
 		bound != TTBound::Exact &&
-		static_cast<int>(target->depth) > depth + 2) {
+		static_cast<int>(targetEntry.depth) > depth + 2) {
 		if (packedMove != 0) {
-			target->move16 = packedMove;
+			targetEntry.move16 = packedMove;
 		}
 		if (staticEval != TT_NO_STATIC_EVAL) {
-			target->staticEval = packStaticEval(staticEval);
+			targetEntry.staticEval = packStaticEval(staticEval);
 		}
-		setGenerationBound(*target, currentGeneration, entryBound(*target));
+		targetEntry.generationBound =
+			makeGenerationBound(currentGeneration, entryBound(targetEntry));
+		const uint64_t updatedData = packTTEntry(targetEntry);
+		target->data.store(updatedData, std::memory_order_release);
+		target->keyXorData.store(key ^ updatedData, std::memory_order_release);
 		return;
 	}
 
-	const bool replacingOccupied = entryBound(*target) != TTBound::Empty;
-	const bool targetSameKey = replacingOccupied && target->key16 == verify;
+	const bool replacingOccupied = targetHadEntry &&
+		entryBound(targetEntry) != TTBound::Empty;
 	const bool replacingDifferent = replacingOccupied &&
-		(target->key16 != verify || target->move16 != packedMove);
+		(!targetSameKey || targetEntry.move16 != packedMove);
 
 	PROFILE_INC(::Profiler::TTStores);
 	if (replacingOccupied) {
 		PROFILE_INC(::Profiler::TTOverwrites);
 		if (replacingDifferent) {
-			if (generationAge(entryGeneration(*target)) != 0) {
+			if (generationAge(entryGeneration(targetEntry)) != 0) {
 				PROFILE_INC(::Profiler::TTReplacedByAge);
 			}
 			else {
@@ -718,33 +950,53 @@ void Engine::storeTT(uint64_t key, int depth, int score, TTBound bound,
 		}
 	}
 	else {
-		++ttUsedEntries;
+		tt->noteNewEntry();
 	}
 
-	target->key16 = verify;
-	target->move16 = (packedMove != 0 || !targetSameKey) ? packedMove : target->move16;
-	target->score = scoreToTT(score, ply);
-	target->staticEval = packStaticEval(staticEval);
-	target->depth = static_cast<uint8_t>(std::clamp(depth, 0, 255));
-	target->reserved = 0;
-	setGenerationBound(*target, currentGeneration, bound);
+	DecodedTTEntry newEntry;
+	newEntry.move16 = (packedMove != 0 || !targetSameKey)
+		? packedMove
+		: targetEntry.move16;
+	newEntry.score = scoreToTT(score, ply);
+	newEntry.staticEval = packStaticEval(staticEval);
+	newEntry.depth = static_cast<uint8_t>(std::clamp(depth, 0, 255));
+	newEntry.generationBound = makeGenerationBound(currentGeneration, bound);
+
+	const uint64_t data = packTTEntry(newEntry);
+	target->data.store(data, std::memory_order_release);
+	target->keyXorData.store(key ^ data, std::memory_order_release);
 }
 
 int Engine::ttHashfullPermille() const
 {
-	if (tt == nullptr || ttClusterCount == 0) {
+	if (!tt || tt->clusterCount() == 0) {
 		return 0;
 	}
 
-	const uint64_t capacity = ttClusterCount * 4ULL;
+	const uint64_t capacity = tt->clusterCount() * 4ULL;
 	return static_cast<int>(std::min<uint64_t>(
-		1000ULL, (ttUsedEntries * 1000ULL) / capacity));
+		1000ULL, (tt->usedEntries() * 1000ULL) / capacity));
 }
 
 bool Engine::shouldStop()
 {
 	if (stopSearch.load(std::memory_order_relaxed)) {
 		return true;
+	}
+
+	if (sharedControl) {
+		if (sharedControl->isStopRequested()) {
+			stopSearch.store(true, std::memory_order_relaxed);
+			return true;
+		}
+		if ((totalNodes & 0x0FFF) != 0) {
+			return false;
+		}
+		if (sharedControl->shouldStop()) {
+			stopSearch.store(true, std::memory_order_relaxed);
+			return true;
+		}
+		return false;
 	}
 
 	if (nodeLimit > 0 &&
@@ -764,6 +1016,20 @@ bool Engine::shouldStop()
 	}
 
 	return false;
+}
+
+long long Engine::countNode()
+{
+	++totalNodes;
+	if (sharedControl) {
+		return sharedControl->countNode();
+	}
+	return totalNodes;
+}
+
+long long Engine::reportedNodeCount() const
+{
+	return sharedControl ? sharedControl->nodesSearched() : totalNodes;
 }
 
 static const int pieceValueSimple[13] = {
@@ -2270,11 +2536,13 @@ Move Engine::findBestMove(board& b, int maxDepth,
 {
 	resetSearchStats();
 	newSearch();
+	lastScore = 0;
+	lastDepth = 0;
 	
 
 	maxDepth = std::clamp(maxDepth, 1, MAX_DEPTH - 1);
 	this->maxDepth = maxDepth;
-	const bool emitUciInfo = uciInfoOutputEnabled();
+	const bool emitUciInfo = emitSearchInfo && uciInfoOutputEnabled();
 	auto recordTTHashfull = [&]() {
 		PROFILE_MAX(::Profiler::TTHashfullPermille, ttHashfullPermille());
 		};
@@ -2282,7 +2550,9 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	// --------------------------------------------
 	// Search start time and repetition root.
 	// --------------------------------------------
-	searchStart = std::chrono::steady_clock::now();
+	searchStart = sharedControl
+		? sharedControl->startTime()
+		: std::chrono::steady_clock::now();
 
 	// --------------------------------------------
 	// Build repetition history
@@ -2317,7 +2587,17 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 	if (rootMoves.empty()) {
 		recordTTHashfull();
+		lastScore = 0;
+		lastDepth = 0;
 		return Move(-1, -1, EMPTY, EMPTY, 0);
+	}
+
+	if (workerId > 0 && rootMoves.size() > 2) {
+		const std::size_t offset =
+			static_cast<std::size_t>(workerId) % rootMoves.size();
+		if (offset != 0) {
+			std::rotate(rootMoves.begin(), rootMoves.begin() + offset, rootMoves.end());
+		}
 	}
 
 	if (rootMoveFilter.empty()) {
@@ -2333,16 +2613,20 @@ Move Engine::findBestMove(board& b, int maxDepth,
 	if(rootMoves.size() == 1)
 	{
 		recordTTHashfull();
+		lastScore = 0;
+		lastDepth = 0;
 		return rootMoves[0];
 	}
 
-	if (syzygyIsAvailable()) {
+	if (workerId == 0 && syzygyIsAvailable()) {
 		int tbScore = 0;
 		Move tbMove;
 		if (probeSyzygyRoot(b, tbScore, tbMove)) {
 			Move legalTbMove;
 			if (findLegalEquivalent(rootMoves, tbMove, legalTbMove)) {
 				recordTTHashfull();
+				lastScore = tbScore;
+				lastDepth = maxDepth;
 				return legalTbMove;
 			}
 		}
@@ -2602,7 +2886,9 @@ Move Engine::findBestMove(board& b, int maxDepth,
 		elapsed =
 			std::chrono::duration_cast<std::chrono::milliseconds>(now - searchStart).count();
 
-		bool timedOut = elapsed >= timeLimitMs || stopSearch.load();
+		bool timedOut = elapsed >= timeLimitMs ||
+			stopSearch.load(std::memory_order_relaxed) ||
+			(sharedControl && sharedControl->shouldStop());
 
 		if (!timedOut && depthCompleted)
 		{
@@ -2613,10 +2899,13 @@ Move Engine::findBestMove(board& b, int maxDepth,
 			bestSafeMove = bestFullMove;
 			bestSafeScore = bestFullScore;
 			haveSafe = true;
+			lastScore = bestFullScore;
+			lastDepth = depth;
 
 			if (emitUciInfo) {
 				// Emit only after a fully completed root depth; never from node loops.
-				emitCompletedDepthInfo(depth, bestFullScore, bestFullMove, totalNodes, searchStart);
+				emitCompletedDepthInfo(depth, bestFullScore, bestFullMove,
+					reportedNodeCount(), searchStart);
 			}
 			continue;
 		}
@@ -2642,13 +2931,17 @@ Move Engine::findBestMove(board& b, int maxDepth,
 
 	if (haveFull) {
 		recordTTHashfull();
+		lastScore = bestFullScore;
 		return bestFullMove;
 	}
 	if (haveSafe) {
 		recordTTHashfull();
+		lastScore = bestSafeScore;
 		return bestSafeMove;
 	}
 	recordTTHashfull();
+	lastScore = 0;
+	lastDepth = 0;
 	return rootMoves[0];
 }
 
@@ -2658,7 +2951,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 {
 	depth = std::clamp(depth, 0, MAX_DEPTH - 1);
 	const int tablePly = std::clamp(ply, 0, MAX_DEPTH - 1);
-	totalNodes++;
+	countNode();
 	PROFILE_INC(::Profiler::SearchNodes);
 #ifdef ENABLE_ENGINE_PROFILING
 	const int profilePly = std::clamp(ply, 0, Profiler::MAX_PROFILE_PLY - 1);
@@ -3141,7 +3434,7 @@ int Engine::search(board& b, int depth, int alpha, int beta, int ply,
 int Engine::quiescence(board& b, int alpha, int beta, int ply, int qply,
 	std::vector<uint64_t>& repHistory)
 {
-	totalNodes++;  // still count these as nodes
+	countNode();  // still count these as nodes
 	PROFILE_INC(::Profiler::QSearchNodes);
 #ifdef ENABLE_ENGINE_PROFILING
 	const int profileQply = std::clamp(qply, 0, Profiler::MAX_PROFILE_PLY - 1);

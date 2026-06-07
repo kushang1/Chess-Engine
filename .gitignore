@@ -1,8 +1,13 @@
 
 x64/
 .vs/
-Book/
-syzygy/
+
+# Optional local data. Keep documentation placeholders, but do not commit
+# opening books or Syzygy tablebase files.
+Book/*
+!Book/README.md
+syzygy/*
+!syzygy/README.md
 
 /tests
 

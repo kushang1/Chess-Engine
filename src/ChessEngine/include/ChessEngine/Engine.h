@@ -6,14 +6,69 @@
 #include "MoveGenerator.h"
 #include "ZobristHashing.h"
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 #include "Syzygy.h"
-#include <chrono>
 #include "Polyglot.h"
-#include <cstdint>
 #include <unordered_map>
+
+class SharedTranspositionTable {
+public:
+    struct alignas(16) Entry {
+        std::atomic<uint64_t> data{ 0 };
+        std::atomic<uint64_t> keyXorData{ 0 };
+    };
+
+    struct alignas(64) Cluster {
+        Entry entries[4];
+    };
+
+    SharedTranspositionTable();
+    ~SharedTranspositionTable();
+
+    SharedTranspositionTable(const SharedTranspositionTable&) = delete;
+    SharedTranspositionTable& operator=(const SharedTranspositionTable&) = delete;
+
+    void resize(int megabytes);
+    void clear();
+    uint8_t newSearch();
+
+    Cluster* clusters() const;
+    uint64_t clusterCount() const;
+    uint64_t clusterMask() const;
+    uint64_t usedEntries() const;
+    void noteNewEntry();
+
+private:
+    Cluster* table = nullptr;
+    uint64_t count = 0;
+    uint64_t mask = 0;
+    std::atomic<uint64_t> used{ 0 };
+    std::atomic<unsigned> generation{ 0 };
+};
+
+class SharedSearchControl {
+public:
+    void start(int milliseconds, long long nodes);
+    void clearStop();
+    void requestStop();
+    bool isStopRequested() const;
+    bool shouldStop();
+    long long countNode();
+    long long nodesSearched() const;
+    std::chrono::steady_clock::time_point startTime() const;
+
+private:
+    alignas(64) std::atomic<bool> stop{ false };
+    alignas(64) std::atomic<long long> nodes{ 0 };
+    std::chrono::steady_clock::time_point started{};
+    int timeLimitMs = 1000;
+    long long nodeLimit = 0;
+};
 
 class CHESS_API Engine {
 public:
@@ -31,8 +86,15 @@ public:
     void setTimeLimitMs(int milliseconds);
     void setNodeLimit(long long nodes);
     void setHashSizeMb(int megabytes);
+    void setSharedTranspositionTable(const std::shared_ptr<SharedTranspositionTable>& table);
+    std::shared_ptr<SharedTranspositionTable> sharedTranspositionTable() const;
+    void setSharedSearchControl(const std::shared_ptr<SharedSearchControl>& control);
+    void setWorkerId(int id);
+    void setEmitUciInfo(bool enabled);
     void clearStop();
     void requestStop();
+    int lastSearchScore() const;
+    int lastSearchDepth() const;
     int debugEvaluate(board& b);
     int debugEvaluateLegacy(const board& b) const;
     std::string debugEvaluateBreakdown(board& b);
@@ -68,25 +130,6 @@ private:
 
     static constexpr int TT_NO_STATIC_EVAL = -32768;
 
-    struct alignas(16) TTEntry {
-        uint16_t key16 = 0;
-        uint16_t move16 = 0;
-        int16_t score = 0;
-        int16_t staticEval = TT_NO_STATIC_EVAL;
-        uint8_t depth = 0;
-        uint8_t generationBound = 0;
-        uint16_t reserved = 0;
-    };
-
-    static_assert(sizeof(TTEntry) == 16, "TTEntry must stay 16 bytes");
-
-    struct alignas(64) TTCluster {
-        TTEntry entries[4];
-    };
-
-    static_assert(sizeof(TTCluster) == 64, "TTCluster must stay one cache line");
-    static_assert(alignof(TTCluster) == 64, "TTCluster must be cache-line aligned");
-
     struct TTProbeResult {
         bool hit = false;
         int score = 0;
@@ -98,10 +141,16 @@ private:
         bool hasStaticEval = false;
     };
 
-    TTCluster* tt = nullptr;
-    uint64_t ttClusterCount = 0;
-    uint64_t ttClusterMask = 0;
-    uint64_t ttUsedEntries = 0;
+    struct DecodedTTEntry {
+        uint16_t move16 = 0;
+        int16_t score = 0;
+        int16_t staticEval = TT_NO_STATIC_EVAL;
+        uint8_t depth = 0;
+        uint8_t generationBound = 0;
+    };
+
+    std::shared_ptr<SharedTranspositionTable> tt;
+    std::shared_ptr<SharedSearchControl> sharedControl;
     uint8_t currentGeneration = 0;
 
     void resizeTranspositionTable(int megabytes);
@@ -111,18 +160,21 @@ private:
     void storeTT(uint64_t key, int depth, int score, TTBound bound,
         const Move& bestMove, int ply, int staticEval = TT_NO_STATIC_EVAL);
     int ttHashfullPermille() const;
-    static uint8_t entryGeneration(const TTEntry& entry);
-    static TTBound entryBound(const TTEntry& entry);
-    static void setGenerationBound(TTEntry& entry, uint8_t generation, TTBound bound);
+    static uint8_t entryGeneration(const DecodedTTEntry& entry);
+    static TTBound entryBound(const DecodedTTEntry& entry);
+    static uint8_t makeGenerationBound(uint8_t generation, TTBound bound);
+    static uint64_t packTTEntry(const DecodedTTEntry& entry);
+    static DecodedTTEntry unpackTTEntry(uint64_t data);
     uint8_t generationAge(uint8_t entryGeneration) const;
-    int replacementScore(const TTEntry& entry) const;
-    uint16_t key16(uint64_t key) const;
+    int replacementScore(const DecodedTTEntry& entry) const;
     uint16_t packMove(const Move& move) const;
     Move unpackMove(uint16_t packed) const;
     int16_t packStaticEval(int staticEval) const;
     int16_t scoreToTT(int score, int ply) const;
     int scoreFromTT(int16_t score, int ply) const;
     bool shouldStop();
+    long long countNode();
+    long long reportedNodeCount() const;
 
     std::atomic<bool> stopSearch;
     long long totalNodes = 0;
@@ -130,6 +182,10 @@ private:
     std::chrono::steady_clock::time_point searchStart;
     int timeLimitMs = 1000;  // default: 5 seconds per move
     long long nodeLimit = 0;
+    int workerId = 0;
+    bool emitSearchInfo = true;
+    int lastScore = 0;
+    int lastDepth = 0;
 
     std::vector<PolyglotEntry> openingBook;
     bool externalDataInitialized = false;

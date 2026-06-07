@@ -7,7 +7,7 @@
 class QButtonGroup;
 class QComboBox;
 class QLabel;
-class QWidget;
+class QPushButton;
 
 class NewGameDialog : public QDialog
 {
@@ -19,14 +19,19 @@ public:
     GameSettings gameSettings() const;
 
 private:
-    QWidget* createModeCard(const QString& title, const QString& subtitle, int id);
+    QPushButton* createModeCard(const QString& title,
+                                const QString& subtitle,
+                                const QString& iconPath,
+                                int id);
+    QPushButton* createDifficultyCard(EngineDifficulty difficulty);
     void updateEngineControls();
 
     GameSettings m_initialSettings;
     QButtonGroup* m_modeGroup = nullptr;
     QButtonGroup* m_sideGroup = nullptr;
-    QComboBox* m_difficultyCombo = nullptr;
+    QButtonGroup* m_difficultyGroup = nullptr;
     QComboBox* m_timeControlCombo = nullptr;
     QWidget* m_enginePanel = nullptr;
+    QLabel* m_difficultyDetails = nullptr;
     QLabel* m_summaryLabel = nullptr;
 };

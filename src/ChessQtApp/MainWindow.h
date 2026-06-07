@@ -49,6 +49,8 @@ private:
     void openSettings();
     void flipBoard();
     void toggleAnalysisDock();
+    void toggleTheme();
+    void toggleSound();
     void updateBoardInputState();
     void updateActionStates();
     bool isBoardInputAllowed() const;
@@ -62,7 +64,9 @@ private:
                                     long long nodes,
                                     long long leafNodes,
                                     int depth,
-                                    int moveTimeMs);
+                                    int elapsedMs,
+                                    int bestScore,
+                                    int threads);
 
     void handleSquareClicked(int square);
     void handleDragStarted(int square);
@@ -72,6 +76,7 @@ private:
     void clearSelection();
     std::vector<Move> legalMovesFrom(int square) const;
     bool tryMakeMove(int from, int to);
+    Move choosePromotionMove(const std::vector<Move>& moves, bool& accepted);
     void completeMove(const Move& move, bool whiteMove, const QString& san, bool animate);
 
     std::array<Piece, 64> boardSnapshot() const;
@@ -87,6 +92,13 @@ private:
     void playMoveFeedback(const Move& move);
     void updateClocks();
     void resetClocks();
+    void resetEngineLab();
+    void updateEngineLab(const QString& bestMove,
+                         long long nodes,
+                         int depth,
+                         int elapsedMs,
+                         int threads,
+                         int scoreCp);
 
     void recordCurrentPosition();
     void restorePosition(int positionIndex);
@@ -101,6 +113,13 @@ private:
     QDockWidget* m_sidebarDock = nullptr;
     QDockWidget* m_bottomDock = nullptr;
     QLabel* m_centerStatus = nullptr;
+    QLabel* m_stageBadge = nullptr;
+    QLabel* m_engineHeadline = nullptr;
+    QLabel* m_engineProfile = nullptr;
+    QLabel* m_engineDepthMetric = nullptr;
+    QLabel* m_engineNodesMetric = nullptr;
+    QLabel* m_engineTimeMetric = nullptr;
+    QLabel* m_engineSpeedMetric = nullptr;
 
     QAction* m_newGameAction = nullptr;
     QAction* m_undoAction = nullptr;
@@ -109,6 +128,8 @@ private:
     QAction* m_flipAction = nullptr;
     QAction* m_analysisAction = nullptr;
     QAction* m_settingsAction = nullptr;
+    QAction* m_themeAction = nullptr;
+    QAction* m_soundAction = nullptr;
 
     QTimer m_clockTimer;
     QElapsedTimer m_clockElapsed;
@@ -130,6 +151,9 @@ private:
     int m_gameGeneration = 0;
     int m_lastSearchDepth = 0;
     int m_lastSearchMoveTimeMs = 0;
+    int m_lastEngineScoreCp = 0;
+    bool m_hasEngineScore = false;
+    QString m_lastBestMove;
 
     std::vector<std::string> m_positionHistory;
     std::vector<uint64_t> m_repetitionHistory;

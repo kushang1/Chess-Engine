@@ -3,6 +3,8 @@
 #include <ChessEngine/EngineFacade.h>
 
 #include <QApplication>
+#include <QFont>
+#include <QStyleFactory>
 
 #include <chrono>
 #include <cstdio>
@@ -232,6 +234,10 @@ int main(int argc, char* argv[])
     }
 
     QApplication app(argc, argv);
+    app.setStyle(QStyleFactory::create("Fusion"));
+    QFont appFont("Segoe UI Variable", 10);
+    appFont.setStyleStrategy(QFont::PreferAntialias);
+    app.setFont(appFont);
     MainWindow window;
     window.show();
     return app.exec();

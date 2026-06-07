@@ -4,16 +4,22 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDockWidget>
 #include <QDir>
 #include <QFile>
+#include <QFrame>
 #include <QGraphicsOpacityEffect>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QKeySequence>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPixmap>
 #include <QPropertyAnimation>
+#include <QPushButton>
 #include <QRandomGenerator>
 #include <QShortcut>
 #include <QStackedWidget>
@@ -326,6 +332,169 @@ QTabBar::tab:selected {
     color: #FFFFFF;
     background: #2C5A53;
 }
+#CentralShell {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #080D14, stop:0.58 #0D131D, stop:1 #101A21);
+}
+#BoardStage {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #121A24, stop:1 #0D141D);
+    border: 1px solid #263343;
+    border-radius: 22px;
+}
+#StageHeader {
+    background: transparent;
+}
+#CenterStatus {
+    color: #F8FBFF;
+    font-size: 20px;
+    font-weight: 800;
+    padding: 2px 4px;
+}
+#StageBadge {
+    color: #BDFEF0;
+    background: #153A38;
+    border: 1px solid #2B6E67;
+    border-radius: 10px;
+    padding: 7px 12px;
+    font-size: 11px;
+    font-weight: 800;
+}
+QToolBar {
+    background: #0E151F;
+    border-bottom: 1px solid #263343;
+    spacing: 5px;
+    padding: 8px 14px;
+}
+QToolButton {
+    color: #CFD8E5;
+    border-radius: 10px;
+    padding: 7px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+QToolButton:hover {
+    color: #FFFFFF;
+    background: #1A2633;
+}
+QToolButton:checked, QToolButton:pressed {
+    color: #D9FFF7;
+    background: #173A37;
+}
+#BrandMark {
+    margin-right: 4px;
+}
+#BrandName {
+    color: #F8FBFF;
+    font-size: 15px;
+    font-weight: 900;
+    letter-spacing: 1px;
+}
+#BrandSubtitle, #MetricLabel {
+    color: #718096;
+    font-size: 10px;
+    font-weight: 800;
+}
+#ToolbarSpacer {
+    background: transparent;
+}
+#EngineLab {
+    background: #0E151F;
+}
+#AnalysisDock::title, #GameDock::title {
+    background: #0E151F;
+    color: #8796A9;
+    border-top: 1px solid #263343;
+}
+#Panel, #PlayerCard, #DialogPanel, #ChoiceCard, #MetricCard {
+    background: #131C27;
+    border: 1px solid #273546;
+    border-radius: 14px;
+}
+#PlayerCard[active="true"] {
+    border: 1px solid #55E4C3;
+    background: #152B2B;
+}
+#ModeLabel {
+    background: #0D141D;
+    color: #B8C6D8;
+    border: 1px solid #273546;
+    border-radius: 12px;
+    padding: 9px 11px;
+}
+#StatusLabel {
+    background: #101923;
+    border: 1px solid #273546;
+    border-radius: 12px;
+}
+#EyebrowLabel {
+    color: #55E4C3;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 2px;
+}
+#ModeCard, #DifficultyCard, #PromotionButton {
+    text-align: left;
+    color: #DCE6F2;
+    background: #131C27;
+    border: 1px solid #2B3A4C;
+    border-radius: 14px;
+    padding: 12px;
+}
+#ModeCard:hover, #DifficultyCard:hover, #PromotionButton:hover {
+    background: #192634;
+    border-color: #4D756F;
+}
+#ModeCard:checked, #DifficultyCard:checked {
+    color: #FFFFFF;
+    background: #173430;
+    border: 2px solid #55E4C3;
+}
+#DifficultyCard[tier="4"]:checked {
+    background: #34253E;
+    border-color: #C58BFF;
+}
+#DifficultyDetails {
+    color: #AEBCCD;
+    background: #0F1721;
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+#EngineHeadline {
+    color: #F7FAFF;
+    font-size: 17px;
+    font-weight: 850;
+}
+#EngineProfile {
+    color: #8F9DB0;
+    font-size: 11px;
+}
+#MetricValue {
+    color: #F7FAFF;
+    font-size: 19px;
+    font-weight: 850;
+}
+#PrimaryButton {
+    background: #55E4C3;
+    color: #07110F;
+    padding: 10px 20px;
+    font-weight: 900;
+}
+#PrimaryButton:hover {
+    background: #75F0D4;
+}
+QComboBox {
+    min-height: 23px;
+}
+QRadioButton {
+    padding: 6px 10px;
+    border-radius: 9px;
+}
+QRadioButton:hover {
+    background: #182431;
+}
+QRadioButton::indicator:checked {
+    background: #55E4C3;
+    border: 3px solid #173430;
+}
 )";
 }
 
@@ -571,6 +740,159 @@ QTabBar::tab:selected {
     color: #FFFFFF;
     background: #208F7B;
 }
+#CentralShell {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #E9F0F5, stop:0.6 #F4F7FA, stop:1 #EAF5F2);
+}
+#BoardStage {
+    background: #FFFFFF;
+    border: 1px solid #D4E0E8;
+    border-radius: 22px;
+}
+#StageHeader {
+    background: transparent;
+}
+#CenterStatus {
+    color: #10202A;
+    font-size: 20px;
+    font-weight: 800;
+    padding: 2px 4px;
+}
+#StageBadge {
+    color: #0D6758;
+    background: #DDF5EF;
+    border: 1px solid #A9DED2;
+    border-radius: 10px;
+    padding: 7px 12px;
+    font-size: 11px;
+    font-weight: 800;
+}
+QToolBar {
+    background: #FFFFFF;
+    border-bottom: 1px solid #D8E3EA;
+    spacing: 5px;
+    padding: 8px 14px;
+}
+QToolButton {
+    color: #425466;
+    border-radius: 10px;
+    padding: 7px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+QToolButton:hover {
+    color: #12212A;
+    background: #EDF3F6;
+}
+QToolButton:checked, QToolButton:pressed {
+    color: #0D6758;
+    background: #DDF5EF;
+}
+#BrandName {
+    color: #10202A;
+    font-size: 15px;
+    font-weight: 900;
+    letter-spacing: 1px;
+}
+#BrandSubtitle, #MetricLabel {
+    color: #7D8D9B;
+    font-size: 10px;
+    font-weight: 800;
+}
+#ToolbarSpacer {
+    background: transparent;
+}
+#EngineLab {
+    background: #F7FAFC;
+}
+#AnalysisDock::title, #GameDock::title {
+    background: #FFFFFF;
+    color: #758694;
+    border-top: 1px solid #D8E3EA;
+}
+#Panel, #PlayerCard, #DialogPanel, #ChoiceCard, #MetricCard {
+    background: #FFFFFF;
+    border: 1px solid #D8E3EA;
+    border-radius: 14px;
+}
+#PlayerCard[active="true"] {
+    border: 1px solid #27A88E;
+    background: #ECF9F5;
+}
+#ModeLabel, #StatusLabel {
+    background: #F1F6F8;
+    border: 1px solid #D8E3EA;
+    border-radius: 12px;
+}
+#EyebrowLabel {
+    color: #15846F;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 2px;
+}
+#ModeCard, #DifficultyCard, #PromotionButton {
+    text-align: left;
+    color: #20313C;
+    background: #F8FAFC;
+    border: 1px solid #D7E2E9;
+    border-radius: 14px;
+    padding: 12px;
+}
+#ModeCard:hover, #DifficultyCard:hover, #PromotionButton:hover {
+    background: #F0F7F5;
+    border-color: #80C9BA;
+}
+#ModeCard:checked, #DifficultyCard:checked {
+    color: #102A24;
+    background: #DDF5EF;
+    border: 2px solid #27A88E;
+}
+#DifficultyCard[tier="4"]:checked {
+    background: #F4EAFE;
+    border-color: #9A64CA;
+}
+#DifficultyDetails {
+    color: #536675;
+    background: #F2F6F8;
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+#EngineHeadline {
+    color: #10202A;
+    font-size: 17px;
+    font-weight: 850;
+}
+#EngineProfile {
+    color: #758694;
+    font-size: 11px;
+}
+#MetricValue {
+    color: #10202A;
+    font-size: 19px;
+    font-weight: 850;
+}
+#PrimaryButton {
+    background: #15846F;
+    color: #FFFFFF;
+    padding: 10px 20px;
+    font-weight: 900;
+}
+#PrimaryButton:hover {
+    background: #1B9C84;
+}
+QComboBox {
+    min-height: 23px;
+}
+QRadioButton {
+    padding: 6px 10px;
+    border-radius: 9px;
+}
+QRadioButton:hover {
+    background: #EDF3F6;
+}
+QRadioButton::indicator:checked {
+    background: #15846F;
+    border: 3px solid #DDF5EF;
+}
 )";
 }
 
@@ -607,14 +929,15 @@ MainWindow::MainWindow(QWidget* parent)
 
 MainWindow::~MainWindow()
 {
-    m_engine.stopSearch();
+    m_engineController->stopSearch();
 }
 
 void MainWindow::buildInterface()
 {
-    setWindowTitle("Chess");
-    resize(1280, 820);
-    setMinimumSize(1040, 700);
+    setWindowTitle("Nova Chess Studio");
+    setWindowIcon(QIcon(":/icons/logo.svg"));
+    resize(1380, 880);
+    setMinimumSize(1120, 720);
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
 
     m_stack = new QStackedWidget(this);
@@ -629,13 +952,25 @@ void MainWindow::buildInterface()
     auto* boardStage = new QWidget(gamePage);
     boardStage->setObjectName("BoardStage");
     auto* boardLayout = new QVBoxLayout(boardStage);
-    boardLayout->setContentsMargins(16, 14, 16, 16);
-    boardLayout->setSpacing(10);
+    boardLayout->setContentsMargins(20, 16, 20, 20);
+    boardLayout->setSpacing(12);
 
-    m_centerStatus = new QLabel(boardStage);
+    auto* stageHeader = new QWidget(boardStage);
+    stageHeader->setObjectName("StageHeader");
+    auto* stageHeaderLayout = new QHBoxLayout(stageHeader);
+    stageHeaderLayout->setContentsMargins(2, 0, 2, 0);
+    stageHeaderLayout->setSpacing(12);
+
+    m_centerStatus = new QLabel("White to move", stageHeader);
     m_centerStatus->setObjectName("CenterStatus");
-    m_centerStatus->setAlignment(Qt::AlignCenter);
-    boardLayout->addWidget(m_centerStatus);
+    m_centerStatus->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    stageHeaderLayout->addWidget(m_centerStatus, 1);
+
+    m_stageBadge = new QLabel("ADVANCED", stageHeader);
+    m_stageBadge->setObjectName("StageBadge");
+    m_stageBadge->setAlignment(Qt::AlignCenter);
+    stageHeaderLayout->addWidget(m_stageBadge);
+    boardLayout->addWidget(stageHeader);
 
     m_board = new ChessBoardWidget(boardStage);
     boardLayout->addWidget(m_board, 1);
@@ -675,10 +1010,32 @@ void MainWindow::buildInterface()
 void MainWindow::buildToolbar()
 {
     auto* toolbar = addToolBar("Controls");
+    toolbar->setObjectName("CommandBar");
     toolbar->setMovable(false);
     toolbar->setFloatable(false);
-    toolbar->setIconSize(QSize(22, 22));
-    toolbar->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    toolbar->setIconSize(QSize(20, 20));
+    toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+
+    auto* brand = new QWidget(toolbar);
+    auto* brandLayout = new QHBoxLayout(brand);
+    brandLayout->setContentsMargins(0, 0, 14, 0);
+    brandLayout->setSpacing(8);
+    auto* brandMark = new QLabel(brand);
+    brandMark->setObjectName("BrandMark");
+    brandMark->setPixmap(QIcon(":/icons/logo.svg").pixmap(32, 32));
+    brandLayout->addWidget(brandMark);
+    auto* brandCopy = new QVBoxLayout();
+    brandCopy->setContentsMargins(0, 0, 0, 0);
+    brandCopy->setSpacing(0);
+    auto* brandName = new QLabel("NOVA CHESS", brand);
+    brandName->setObjectName("BrandName");
+    auto* brandSubtitle = new QLabel("PLAY. STUDY. MASTER.", brand);
+    brandSubtitle->setObjectName("BrandSubtitle");
+    brandCopy->addWidget(brandName);
+    brandCopy->addWidget(brandSubtitle);
+    brandLayout->addLayout(brandCopy);
+    toolbar->addWidget(brand);
+    toolbar->addSeparator();
 
     m_newGameAction = toolbar->addAction(QIcon(":/icons/new-game.svg"), "New Game");
     m_newGameAction->setShortcut(QKeySequence("Ctrl+N"));
@@ -705,13 +1062,28 @@ void MainWindow::buildToolbar()
     m_analysisAction = toolbar->addAction(QIcon(":/icons/analysis.svg"), "Analysis");
     m_analysisAction->setCheckable(true);
     m_analysisAction->setToolTip("Show Analysis");
-    m_analysisAction->setStatusTip("Show or hide the analysis and chat panel.");
+    m_analysisAction->setStatusTip("Show or hide the live Engine Lab.");
 
     toolbar->addSeparator();
 
     m_resignAction = toolbar->addAction(QIcon(":/icons/resign.svg"), "Resign");
     m_resignAction->setToolTip("Resign");
     m_resignAction->setStatusTip("Resign the current game.");
+
+    auto* spacer = new QWidget(toolbar);
+    spacer->setObjectName("ToolbarSpacer");
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(spacer);
+
+    m_themeAction = toolbar->addAction(QIcon(":/icons/theme.svg"), "Theme");
+    m_themeAction->setCheckable(true);
+    m_themeAction->setChecked(m_appSettings.ui.darkTheme);
+    m_themeAction->setToolTip("Toggle light and dark theme");
+
+    m_soundAction = toolbar->addAction(QIcon(":/icons/sound.svg"), "Sound");
+    m_soundAction->setCheckable(true);
+    m_soundAction->setChecked(m_appSettings.ui.soundsEnabled);
+    m_soundAction->setToolTip("Toggle move sounds");
 
     m_settingsAction = toolbar->addAction(QIcon(":/icons/settings.svg"), "Settings");
     m_settingsAction->setShortcut(QKeySequence("Ctrl+,"));
@@ -725,6 +1097,8 @@ void MainWindow::buildToolbar()
     connect(m_settingsAction, &QAction::triggered, this, &MainWindow::openSettings);
     connect(m_flipAction, &QAction::triggered, this, &MainWindow::flipBoard);
     connect(m_analysisAction, &QAction::triggered, this, &MainWindow::toggleAnalysisDock);
+    connect(m_themeAction, &QAction::triggered, this, &MainWindow::toggleTheme);
+    connect(m_soundAction, &QAction::triggered, this, &MainWindow::toggleSound);
 }
 
 void MainWindow::buildSidebarDock()
@@ -737,7 +1111,7 @@ void MainWindow::buildSidebarDock()
     connect(m_sidebar->moveListWidget(), &MoveListWidget::nextMoveRequested,
             this, &MainWindow::redoMove);
 
-    m_sidebarDock = new QDockWidget("Game", this);
+    m_sidebarDock = new QDockWidget("Match Center", this);
     m_sidebarDock->setObjectName("GameDock");
     m_sidebarDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
     m_sidebarDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
@@ -749,36 +1123,72 @@ void MainWindow::buildSidebarDock()
 
 void MainWindow::buildBottomDock()
 {
-    auto* tabs = new QTabWidget(this);
-    tabs->setObjectName("BottomTabs");
+    auto* lab = new QWidget(this);
+    lab->setObjectName("EngineLab");
+    auto* root = new QHBoxLayout(lab);
+    root->setContentsMargins(18, 14, 18, 14);
+    root->setSpacing(16);
 
-    auto* analysis = new QTextEdit(tabs);
-    analysis->setReadOnly(true);
-    analysis->setPlainText("Principal variation\nEvaluation\nDepth");
-    tabs->addTab(analysis, "Analysis");
+    auto* summary = new QWidget(lab);
+    summary->setMinimumWidth(270);
+    auto* summaryLayout = new QVBoxLayout(summary);
+    summaryLayout->setContentsMargins(0, 2, 12, 2);
+    summaryLayout->setSpacing(4);
+    auto* eyebrow = new QLabel("ENGINE LAB", summary);
+    eyebrow->setObjectName("EyebrowLabel");
+    summaryLayout->addWidget(eyebrow);
+    m_engineHeadline = new QLabel("Ready for the first move", summary);
+    m_engineHeadline->setObjectName("EngineHeadline");
+    summaryLayout->addWidget(m_engineHeadline);
+    m_engineProfile = new QLabel(summary);
+    m_engineProfile->setObjectName("EngineProfile");
+    m_engineProfile->setWordWrap(true);
+    summaryLayout->addWidget(m_engineProfile);
+    summaryLayout->addStretch();
+    root->addWidget(summary, 2);
 
-    auto* chat = new QTextEdit(tabs);
-    chat->setPlaceholderText("Multiplayer chat");
-    tabs->addTab(chat, "Chat");
+    auto createMetric = [lab](const QString& title, QLabel*& value) {
+        auto* card = new QWidget(lab);
+        card->setObjectName("MetricCard");
+        auto* layout = new QVBoxLayout(card);
+        layout->setContentsMargins(14, 11, 14, 11);
+        layout->setSpacing(3);
+        auto* label = new QLabel(title, card);
+        label->setObjectName("MetricLabel");
+        value = new QLabel("-", card);
+        value->setObjectName("MetricValue");
+        layout->addWidget(label);
+        layout->addWidget(value);
+        layout->addStretch();
+        return card;
+    };
 
-    auto* history = new QTextEdit(tabs);
-    history->setReadOnly(true);
-    history->setPlainText("Recent games");
-    tabs->addTab(history, "History");
+    root->addWidget(createMetric("DEPTH", m_engineDepthMetric), 1);
+    root->addWidget(createMetric("NODES", m_engineNodesMetric), 1);
+    root->addWidget(createMetric("THINK TIME", m_engineTimeMetric), 1);
+    root->addWidget(createMetric("SPEED", m_engineSpeedMetric), 1);
 
-    m_bottomDock = new QDockWidget("Analysis", this);
+    m_bottomDock = new QDockWidget("Engine Lab", this);
     m_bottomDock->setObjectName("AnalysisDock");
     m_bottomDock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
     m_bottomDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
-    m_bottomDock->setWidget(tabs);
+    m_bottomDock->setWidget(lab);
     addDockWidget(Qt::BottomDockWidgetArea, m_bottomDock);
+    resizeDocks(QList<QDockWidget*>{ m_bottomDock }, QList<int>{ 180 }, Qt::Vertical);
     m_bottomDock->setVisible(m_appSettings.ui.showAnalysis);
     m_analysisAction->setChecked(m_appSettings.ui.showAnalysis);
+    resetEngineLab();
 }
 
 void MainWindow::applyTheme()
 {
     qApp->setStyleSheet(m_appSettings.ui.darkTheme ? darkStyleSheet() : lightStyleSheet());
+    if (m_themeAction) {
+        m_themeAction->setChecked(m_appSettings.ui.darkTheme);
+    }
+    if (m_soundAction) {
+        m_soundAction->setChecked(m_appSettings.ui.soundsEnabled);
+    }
     if (m_board) {
         m_board->setCoordinatesVisible(m_appSettings.ui.coordinatesVisible);
         m_board->setAnimationsEnabled(m_appSettings.ui.animationsEnabled);
@@ -882,6 +1292,7 @@ void MainWindow::newGame()
 
 void MainWindow::startGame(const GameSettings& settings)
 {
+    m_engineController->stopSearch();
     ++m_gameGeneration;
     m_engineThinking = false;
     m_moveAnimationInProgress = false;
@@ -891,6 +1302,9 @@ void MainWindow::startGame(const GameSettings& settings)
     m_lastTo = -1;
     m_lastSearchDepth = 0;
     m_lastSearchMoveTimeMs = 0;
+    m_lastEngineScoreCp = 0;
+    m_hasEngineScore = false;
+    m_lastBestMove.clear();
 
     m_appSettings.game = settings;
     if (m_appSettings.game.gameMode == GameMode::HumanVsEngine && m_appSettings.game.playerSide == PlayerSide::Random) {
@@ -915,6 +1329,7 @@ void MainWindow::startGame(const GameSettings& settings)
     m_sidebar->setSearchSummary("Ready");
     m_sidebar->setEvaluation(0.0);
     m_sidebar->setMaterialSummary(0, 0);
+    resetEngineLab();
     m_board->clearLastMove();
     m_board->clearSelection();
     m_board->setCheckSquare(-1);
@@ -1005,6 +1420,20 @@ void MainWindow::toggleAnalysisDock()
     }
 }
 
+void MainWindow::toggleTheme()
+{
+    m_appSettings.ui.darkTheme = m_themeAction->isChecked();
+    m_appSettings.save();
+    applyTheme();
+}
+
+void MainWindow::toggleSound()
+{
+    m_appSettings.ui.soundsEnabled = m_soundAction->isChecked();
+    m_appSettings.save();
+    statusBar()->showMessage(m_appSettings.ui.soundsEnabled ? "Move sounds enabled" : "Move sounds muted", 2200);
+}
+
 void MainWindow::updateBoardInputState()
 {
     m_board->setBoardInputEnabled(isBoardInputAllowed());
@@ -1020,6 +1449,8 @@ void MainWindow::updateActionStates()
     m_resignAction->setEnabled(!m_engineThinking && !m_gameFinished);
     m_flipAction->setEnabled(true);
     m_settingsAction->setEnabled(true);
+    m_themeAction->setEnabled(true);
+    m_soundAction->setEnabled(true);
 }
 
 bool MainWindow::isBoardInputAllowed() const
@@ -1087,6 +1518,13 @@ void MainWindow::handleEngineSearchStarted(int generation)
     m_sidebar->setSearchSummary(QString("Searching\nDepth: %1\nLevel: %2")
                                 .arg(difficultyDepth(m_appSettings.game.engineDifficulty))
                                 .arg(difficultyText(m_appSettings.game.engineDifficulty)));
+    m_engineHeadline->setText("Calculating the strongest continuation");
+    m_engineProfile->setText(difficultyDescription(m_appSettings.game.engineDifficulty) + "\n" +
+                             difficultySpecText(m_appSettings.game.engineDifficulty));
+    m_engineDepthMetric->setText("...");
+    m_engineNodesMetric->setText("...");
+    m_engineTimeMetric->setText("...");
+    m_engineSpeedMetric->setText("...");
     m_centerStatus->setText("Engine thinking...");
     statusBar()->showMessage("Engine thinking...");
     updateBoardInputState();
@@ -1098,7 +1536,9 @@ void MainWindow::handleEngineSearchFinished(int generation,
                                             long long nodes,
                                             long long leafNodes,
                                             int depth,
-                                            int moveTimeMs)
+                                            int elapsedMs,
+                                            int bestScore,
+                                            int threads)
 {
     if (generation != m_gameGeneration) {
         return;
@@ -1107,7 +1547,7 @@ void MainWindow::handleEngineSearchFinished(int generation,
     m_engineThinking = false;
     m_sidebar->setThinking(false);
     m_lastSearchDepth = depth;
-    m_lastSearchMoveTimeMs = moveTimeMs;
+    m_lastSearchMoveTimeMs = elapsedMs;
 
     if (bestMove.from == -1 || !isEngineTurn()) {
         m_gameFinished = true;
@@ -1121,6 +1561,9 @@ void MainWindow::handleEngineSearchFinished(int generation,
     const bool engineWasWhite = m_engine.isWhiteTurn();
     const QString san = QString::fromStdString(m_engine.moveToSan(bestMove));
     const QString uci = moveText(bestMove);
+    m_lastBestMove = uci;
+    m_lastEngineScoreCp = engineWasWhite ? bestScore : -bestScore;
+    m_hasEngineScore = true;
     if (!m_engine.makeMove(bestMove)) {
         m_gameFinished = true;
         m_centerStatus->setText("Engine returned an illegal move");
@@ -1130,11 +1573,13 @@ void MainWindow::handleEngineSearchFinished(int generation,
         return;
     }
 
-    m_sidebar->setSearchSummary(QString("Best: %1\nNodes: %2\nLeaf nodes: %3\nTime: %4 ms")
+    m_sidebar->setSearchSummary(QString("Best: %1\nDepth: %2\nNodes: %3\nTime: %4 ms")
                                 .arg(uci)
+                                .arg(depth)
                                 .arg(nodes)
-                                .arg(leafNodes)
-                                .arg(moveTimeMs));
+                                .arg(elapsedMs));
+    Q_UNUSED(leafNodes);
+    updateEngineLab(uci, nodes, depth, elapsedMs, threads, m_lastEngineScoreCp);
     completeMove(bestMove, engineWasWhite, san, true);
     statusBar()->showMessage(modeStatusText());
 }
@@ -1231,22 +1676,32 @@ bool MainWindow::tryMakeMove(int from, int to)
         return false;
     }
 
-    Move selectedMove;
-    bool valid = false;
+    std::vector<Move> matchingMoves;
     for (const Move& move : m_engine.legalMoves()) {
-        if (move.from != from || move.to != to) {
-            continue;
-        }
-
-        selectedMove = move;
-        valid = true;
-        if (!move.wasPromotion || m_appSettings.ui.autoQueenPromotion || move.promotedTo == WQ || move.promotedTo == BQ) {
-            break;
+        if (move.from == from && move.to == to) {
+            matchingMoves.push_back(move);
         }
     }
 
-    if (!valid) {
+    if (matchingMoves.empty()) {
         return false;
+    }
+
+    Move selectedMove = matchingMoves.front();
+    if (matchingMoves.size() > 1 && !m_appSettings.ui.autoQueenPromotion) {
+        bool accepted = false;
+        selectedMove = choosePromotionMove(matchingMoves, accepted);
+        if (!accepted) {
+            return false;
+        }
+    }
+    else {
+        const auto queen = std::find_if(matchingMoves.begin(), matchingMoves.end(), [](const Move& move) {
+            return move.promotedTo == WQ || move.promotedTo == BQ;
+        });
+        if (queen != matchingMoves.end()) {
+            selectedMove = *queen;
+        }
     }
 
     truncateHistory();
@@ -1259,6 +1714,66 @@ bool MainWindow::tryMakeMove(int from, int to)
 
     completeMove(selectedMove, whiteMove, san, true);
     return true;
+}
+
+Move MainWindow::choosePromotionMove(const std::vector<Move>& moves, bool& accepted)
+{
+    accepted = false;
+    Move selection = moves.empty() ? Move{} : moves.front();
+
+    QDialog dialog(this);
+    dialog.setObjectName("PromotionDialog");
+    dialog.setWindowTitle("Choose Promotion");
+    dialog.setModal(true);
+    dialog.setMinimumWidth(520);
+
+    auto* root = new QVBoxLayout(&dialog);
+    root->setContentsMargins(22, 22, 22, 18);
+    root->setSpacing(14);
+
+    auto* eyebrow = new QLabel("PAWN PROMOTION", &dialog);
+    eyebrow->setObjectName("EyebrowLabel");
+    root->addWidget(eyebrow);
+    auto* title = new QLabel("Choose your new piece", &dialog);
+    title->setObjectName("DialogTitle");
+    root->addWidget(title);
+
+    auto* choices = new QHBoxLayout();
+    choices->setSpacing(10);
+    for (const Move& move : moves) {
+        QString name;
+        QString resource;
+        switch (move.promotedTo) {
+        case WQ: name = "Queen"; resource = ":/pieces/white_queen.png"; break;
+        case WR: name = "Rook"; resource = ":/pieces/white_rook.png"; break;
+        case WB: name = "Bishop"; resource = ":/pieces/white_bishop.png"; break;
+        case WN: name = "Knight"; resource = ":/pieces/white_knight.png"; break;
+        case BQ: name = "Queen"; resource = ":/pieces/black_queen.png"; break;
+        case BR: name = "Rook"; resource = ":/pieces/black_rook.png"; break;
+        case BB: name = "Bishop"; resource = ":/pieces/black_bishop.png"; break;
+        case BN: name = "Knight"; resource = ":/pieces/black_knight.png"; break;
+        default: continue;
+        }
+
+        auto* button = new QPushButton(QIcon(resource), name, &dialog);
+        button->setObjectName("PromotionButton");
+        button->setIconSize(QSize(42, 42));
+        button->setMinimumHeight(76);
+        button->setCursor(Qt::PointingHandCursor);
+        choices->addWidget(button, 1);
+        connect(button, &QPushButton::clicked, &dialog, [&, move]() {
+            selection = move;
+            accepted = true;
+            dialog.accept();
+        });
+    }
+    root->addLayout(choices);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    root->addWidget(buttons);
+    dialog.exec();
+    return selection;
 }
 
 void MainWindow::completeMove(const Move& move, bool whiteMove, const QString& san, bool animate)
@@ -1274,6 +1789,11 @@ void MainWindow::completeMove(const Move& move, bool whiteMove, const QString& s
     addMoveToHistory(whiteMove, san);
     m_sidebar->setCurrentPly(m_currentMoveIndex);
     playMoveFeedback(move);
+    if (m_appSettings.game.gameMode == GameMode::HumanVsEngine && isEngineTurn()) {
+        m_hasEngineScore = false;
+        m_lastBestMove.clear();
+        m_lastSearchDepth = 0;
+    }
     updateGameStatusViews();
 
     if (!checkDrawByRepetitionOr50()) {
@@ -1319,10 +1839,12 @@ void MainWindow::updateGameStatusViews()
     m_activeClockWhite = m_engine.isWhiteTurn();
     m_sidebar->setActivePlayer(m_activeClockWhite);
     const std::array<Piece, 64> board = boardSnapshot();
-    const double eval = materialScore(board);
+    const double eval = m_hasEngineScore
+        ? static_cast<double>(m_lastEngineScoreCp) / 100.0
+        : materialScore(board);
     m_sidebar->setEvaluation(eval);
     m_sidebar->setMaterialSummary(materialForWhite(true), materialForWhite(false));
-    m_sidebar->setAnalysisDetails(m_lastTo >= 0 ? squareName(m_lastFrom) + squareName(m_lastTo) : QString(),
+    m_sidebar->setAnalysisDetails(m_lastBestMove,
                                   eval,
                                   m_lastSearchDepth,
                                   difficultyText(m_appSettings.game.engineDifficulty));
@@ -1403,11 +1925,13 @@ void MainWindow::updateModeStatus()
     if (m_appSettings.game.gameMode == GameMode::HumanVsHuman) {
         m_sidebar->setModeText("Human vs Human");
         m_sidebar->setPlayerInfo("Local Player", "White", "Local Player", "Black");
+        m_stageBadge->setText("LOCAL MATCH");
         return;
     }
 
     const QString humanSide = playerSideText(m_resolvedHumanSide);
     m_sidebar->setModeText(QString("Human vs Engine - %1").arg(difficultyText(m_appSettings.game.engineDifficulty)));
+    m_stageBadge->setText(difficultyText(m_appSettings.game.engineDifficulty).toUpper());
     if (m_resolvedHumanSide == PlayerSide::White) {
         m_sidebar->setPlayerInfo("You", "White", "Engine", "Black");
     }
@@ -1529,6 +2053,62 @@ void MainWindow::resetClocks()
     m_sidebar->setActivePlayer(true);
 }
 
+void MainWindow::resetEngineLab()
+{
+    if (!m_engineHeadline) {
+        return;
+    }
+
+    const bool engineGame = m_appSettings.game.gameMode == GameMode::HumanVsEngine;
+    m_engineHeadline->setText(engineGame ? "Ready for the first move" : "Local match in progress");
+    m_engineProfile->setText(engineGame
+        ? difficultyDescription(m_appSettings.game.engineDifficulty) + "\n" +
+          difficultySpecText(m_appSettings.game.engineDifficulty)
+        : "Engine search is paused during a local two-player match.");
+    m_engineDepthMetric->setText("-");
+    m_engineNodesMetric->setText("-");
+    m_engineTimeMetric->setText("-");
+    m_engineSpeedMetric->setText("-");
+}
+
+void MainWindow::updateEngineLab(const QString& bestMove,
+                                 long long nodes,
+                                 int depth,
+                                 int elapsedMs,
+                                 int threads,
+                                 int scoreCp)
+{
+    auto compactNumber = [](long long value) {
+        if (value >= 1000000000LL) {
+            return QString("%1B").arg(value / 1000000000.0, 0, 'f', 1);
+        }
+        if (value >= 1000000LL) {
+            return QString("%1M").arg(value / 1000000.0, 0, 'f', 1);
+        }
+        if (value >= 1000LL) {
+            return QString("%1K").arg(value / 1000.0, 0, 'f', 1);
+        }
+        return QString::number(value);
+    };
+
+    const long long nodesPerSecond = elapsedMs > 0 ? (nodes * 1000LL) / elapsedMs : 0;
+    const QString score = std::abs(scoreCp) >= 90000
+        ? QString("mate")
+        : QString("%1%2").arg(scoreCp >= 0 ? "+" : "").arg(scoreCp / 100.0, 0, 'f', 2);
+
+    m_engineHeadline->setText(QString("Best line %1  |  Eval %2").arg(bestMove, score));
+    m_engineProfile->setText(QString("%1 strength completed the search with %2 active thread%3.")
+                             .arg(difficultyText(m_appSettings.game.engineDifficulty))
+                             .arg(threads)
+                             .arg(threads == 1 ? "" : "s"));
+    m_engineDepthMetric->setText(QString::number(depth));
+    m_engineNodesMetric->setText(compactNumber(nodes));
+    m_engineTimeMetric->setText(elapsedMs >= 1000
+        ? QString("%1s").arg(elapsedMs / 1000.0, 0, 'f', 2)
+        : QString("%1ms").arg(elapsedMs));
+    m_engineSpeedMetric->setText(compactNumber(nodesPerSecond) + "/s");
+}
+
 void MainWindow::recordCurrentPosition()
 {
     m_positionHistory.push_back(m_engine.currentFen());
@@ -1545,6 +2125,10 @@ void MainWindow::restorePosition(int positionIndex)
     m_engine.setPositionFromFen(m_positionHistory[m_currentMoveIndex]);
     clearSelection();
     m_gameFinished = false;
+    m_hasEngineScore = false;
+    m_lastBestMove.clear();
+    m_lastSearchDepth = 0;
+    resetEngineLab();
 
     if (m_currentMoveIndex > 0 && m_currentMoveIndex - 1 < static_cast<int>(m_moveHistory.size())) {
         m_lastFrom = m_moveHistory[m_currentMoveIndex - 1].from;

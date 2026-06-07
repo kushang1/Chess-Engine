@@ -1,6 +1,9 @@
 #include "GameSettings.h"
 
 #include <QSettings>
+#include <QThread>
+
+#include <algorithm>
 
 namespace {
 
@@ -47,7 +50,7 @@ AppSettings AppSettings::load()
     settings.beginGroup("Engine");
     appSettings.ui.defaultEngineDifficulty = enumFromInt(settings.value("defaultDifficulty", static_cast<int>(appSettings.ui.defaultEngineDifficulty)).toInt(),
                                                          appSettings.ui.defaultEngineDifficulty,
-                                                         static_cast<int>(EngineDifficulty::Expert));
+                                                         static_cast<int>(EngineDifficulty::Master));
     appSettings.ui.showAnalysis = settings.value("showAnalysis", appSettings.ui.showAnalysis).toBool();
     appSettings.ui.showThinkingIndicator = settings.value("showThinkingIndicator", appSettings.ui.showThinkingIndicator).toBool();
     settings.endGroup();
@@ -61,7 +64,7 @@ AppSettings AppSettings::load()
                                               static_cast<int>(PlayerSide::Random));
     appSettings.game.engineDifficulty = enumFromInt(settings.value("difficulty", static_cast<int>(appSettings.ui.defaultEngineDifficulty)).toInt(),
                                                     appSettings.ui.defaultEngineDifficulty,
-                                                    static_cast<int>(EngineDifficulty::Expert));
+                                                    static_cast<int>(EngineDifficulty::Master));
     appSettings.game.initialTimeMs = settings.value("initialTimeMs", appSettings.game.initialTimeMs).toLongLong();
     settings.endGroup();
 
@@ -128,12 +131,39 @@ QString difficultyText(EngineDifficulty difficulty)
 {
     switch (difficulty) {
     case EngineDifficulty::Beginner: return "Beginner";
-    case EngineDifficulty::Easy: return "Easy";
-    case EngineDifficulty::Medium: return "Medium";
-    case EngineDifficulty::Hard: return "Hard";
+    case EngineDifficulty::Intermediate: return "Intermediate";
+    case EngineDifficulty::Advanced: return "Advanced";
     case EngineDifficulty::Expert: return "Expert";
+    case EngineDifficulty::Master: return "Master";
     }
-    return "Medium";
+    return "Advanced";
+}
+
+QString difficultyDescription(EngineDifficulty difficulty)
+{
+    switch (difficulty) {
+    case EngineDifficulty::Beginner: return "Learns with you and responds almost instantly.";
+    case EngineDifficulty::Intermediate: return "Sees short tactics and punishes loose pieces.";
+    case EngineDifficulty::Advanced: return "A balanced club-level challenge with deeper plans.";
+    case EngineDifficulty::Expert: return "Calculates hard, uses multiple threads, and rarely slips.";
+    case EngineDifficulty::Master: return "Maximum engine depth, time, memory, and available CPU power.";
+    }
+    return {};
+}
+
+QString difficultySpecText(EngineDifficulty difficulty)
+{
+    const int depth = difficultyDepth(difficulty);
+    const int milliseconds = difficultyMoveTimeMs(difficulty);
+    const QString time = milliseconds >= 1000
+        ? QString("%1s").arg(milliseconds / 1000.0, 0, 'g', 3)
+        : QString("%1ms").arg(milliseconds);
+    return QString("Depth %1  |  %2  |  %3 thread%4  |  %5 MB hash")
+        .arg(depth)
+        .arg(time)
+        .arg(difficultyThreadCount(difficulty))
+        .arg(difficultyThreadCount(difficulty) == 1 ? "" : "s")
+        .arg(difficultyHashSizeMb(difficulty));
 }
 
 QString boardThemeText(ChessBoardWidget::BoardTheme theme)
@@ -151,23 +181,48 @@ QString boardThemeText(ChessBoardWidget::BoardTheme theme)
 int difficultyDepth(EngineDifficulty difficulty)
 {
     switch (difficulty) {
-    case EngineDifficulty::Beginner: return 1;
-    case EngineDifficulty::Easy: return 2;
-    case EngineDifficulty::Medium: return 4;
-    case EngineDifficulty::Hard: return 6;
-    case EngineDifficulty::Expert: return 8;
+    case EngineDifficulty::Beginner: return 2;
+    case EngineDifficulty::Intermediate: return 5;
+    case EngineDifficulty::Advanced: return 8;
+    case EngineDifficulty::Expert: return 14;
+    case EngineDifficulty::Master: return 128;
     }
-    return 4;
+    return 8;
 }
 
 int difficultyMoveTimeMs(EngineDifficulty difficulty)
 {
     switch (difficulty) {
-    case EngineDifficulty::Beginner: return 120;
-    case EngineDifficulty::Easy: return 250;
-    case EngineDifficulty::Medium: return 600;
-    case EngineDifficulty::Hard: return 1100;
-    case EngineDifficulty::Expert: return 1800;
+    case EngineDifficulty::Beginner: return 180;
+    case EngineDifficulty::Intermediate: return 700;
+    case EngineDifficulty::Advanced: return 2000;
+    case EngineDifficulty::Expert: return 6000;
+    case EngineDifficulty::Master: return 15000;
     }
-    return 600;
+    return 2000;
+}
+
+int difficultyThreadCount(EngineDifficulty difficulty)
+{
+    const int available = std::max(1, QThread::idealThreadCount());
+    switch (difficulty) {
+    case EngineDifficulty::Beginner: return 1;
+    case EngineDifficulty::Intermediate: return 1;
+    case EngineDifficulty::Advanced: return std::min(2, available);
+    case EngineDifficulty::Expert: return std::min(4, available);
+    case EngineDifficulty::Master: return std::min(32, available);
+    }
+    return 1;
+}
+
+int difficultyHashSizeMb(EngineDifficulty difficulty)
+{
+    switch (difficulty) {
+    case EngineDifficulty::Beginner: return 16;
+    case EngineDifficulty::Intermediate: return 32;
+    case EngineDifficulty::Advanced: return 96;
+    case EngineDifficulty::Expert: return 256;
+    case EngineDifficulty::Master: return 512;
+    }
+    return 96;
 }

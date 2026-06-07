@@ -219,7 +219,7 @@ void UciLoop::handleUci()
     writeLine("id name ChessEngine");
     writeLine("id author Kushang Panchal");
     writeLine("option name Hash type spin default 128 min 1 max 4096");
-    writeLine("option name Threads type spin default 1 min 1 max 1");
+    writeLine("option name Threads type spin default 1 min 1 max 256");
     writeLine("option name Move Overhead type spin default 30 min 0 max 5000");
     writeLine("uciok");
 }
@@ -252,7 +252,9 @@ void UciLoop::handleSetOption(const std::vector<std::string>& tokens)
         engine.setHashSizeMb(hashSizeMb);
     }
     else if (name == "Threads") {
-        searchThreads = std::clamp(parseInt(tokens[valueIndex], searchThreads), 1, 1);
+        searchThreads = std::clamp(parseInt(tokens[valueIndex], searchThreads), 1, 256);
+        stopSearch();
+        engine.setThreadCount(searchThreads);
     }
 }
 
@@ -654,10 +656,24 @@ void UciLoop::startSearch(const chess::SearchLimits& limits)
     std::vector<uint64_t> repetitions = repetitionHistory;
     engine.clearSearchStop();
     searchRunning.store(true, std::memory_order_release);
+    writeLine("info string threads=" + std::to_string(searchThreads));
+    writeLine("info string worker_count=" + std::to_string(searchThreads));
+    writeLine("info string shared_tt=true");
 
     searchThread = std::thread([this, limits, repetitions]() {
         chess::SearchResult result = engine.findBestMove(limits, repetitions);
         std::string bestMove = moveToLongAlgebraic(result.bestMove);
+
+        if (result.workerNodes.size() > 1) {
+            std::string workerLine = "info string nodes_per_worker=";
+            for (std::size_t i = 0; i < result.workerNodes.size(); ++i) {
+                if (i != 0) {
+                    workerLine.push_back(',');
+                }
+                workerLine += std::to_string(result.workerNodes[i]);
+            }
+            writeLine(workerLine);
+        }
 
         writeLine("bestmove " + bestMove);
         searchRunning.store(false, std::memory_order_release);

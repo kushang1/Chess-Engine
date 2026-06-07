@@ -35,6 +35,8 @@ public:
     SearchResult findBestMove(const SearchLimits& limits);
     SearchResult findBestMove(const SearchLimits& limits, const std::vector<uint64_t>& repetitionHistory);
     void setHashSizeMb(int megabytes);
+    void setThreadCount(int threads);
+    int threadCount() const;
     void clearSearchStop();
     void stopSearch();
     int evaluate() const;

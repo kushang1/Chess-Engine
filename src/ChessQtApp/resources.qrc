@@ -14,6 +14,7 @@
         <file alias="black_king.png">../../images/black_king.png</file>
     </qresource>
     <qresource prefix="/icons">
+        <file alias="logo.svg">icons/logo.svg</file>
         <file alias="new-game.svg">icons/new-game.svg</file>
         <file alias="undo.svg">icons/undo.svg</file>
         <file alias="redo.svg">icons/redo.svg</file>

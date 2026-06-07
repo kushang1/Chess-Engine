@@ -5,6 +5,7 @@
 #include <QHBoxLayout>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPixmap>
 #include <QPropertyAnimation>
 #include <QSplitter>
 #include <QStyle>
@@ -104,7 +105,7 @@ SidebarWidget::SidebarWidget(QWidget* parent)
     : QWidget(parent)
 {
     setObjectName("Sidebar");
-    setMinimumWidth(300);
+    setMinimumWidth(330);
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(16, 16, 16, 16);
@@ -227,7 +228,7 @@ void SidebarWidget::setStatusText(const QString& status)
 
 void SidebarWidget::setThinking(bool thinking)
 {
-    m_thinkingLabel->setText(thinking ? "Engine thinking" : "Engine idle");
+    m_thinkingLabel->setText(thinking ? "CALCULATING" : "ENGINE READY");
     m_thinkingLabel->setProperty("thinking", thinking);
     polish(m_thinkingLabel);
 }
@@ -286,15 +287,18 @@ QWidget* SidebarWidget::createPlayerCard(const QString& name, const QString& sub
 {
     auto* card = new QWidget(this);
     card->setObjectName("PlayerCard");
+    card->setMinimumHeight(68);
 
     auto* layout = new QHBoxLayout(card);
     layout->setContentsMargins(12, 10, 12, 10);
     layout->setSpacing(10);
 
-    auto* avatar = new QLabel(white ? "W" : "B", card);
+    auto* avatar = new QLabel(card);
     avatar->setObjectName(white ? "LightAvatar" : "DarkAvatar");
     avatar->setAlignment(Qt::AlignCenter);
     avatar->setFixedSize(42, 42);
+    avatar->setPixmap(QPixmap(white ? ":/pieces/white_king.png" : ":/pieces/black_king.png")
+                          .scaled(34, 34, Qt::KeepAspectRatio, Qt::SmoothTransformation));
     layout->addWidget(avatar);
 
     auto* textColumn = new QVBoxLayout();

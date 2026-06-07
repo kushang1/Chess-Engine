@@ -12,6 +12,10 @@ struct SearchResult {
     long long nodes = 0;
     long long leafNodes = 0;
     int elapsedMs = 0;
+    int bestScore = 0;
+    int completedDepth = 0;
+    int threads = 1;
+    std::vector<long long> workerNodes;
 };
 
 struct PerftResult {

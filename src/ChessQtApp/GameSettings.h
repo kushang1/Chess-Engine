@@ -12,10 +12,10 @@ enum class GameMode {
 
 enum class EngineDifficulty {
     Beginner,
-    Easy,
-    Medium,
-    Hard,
-    Expert
+    Intermediate,
+    Advanced,
+    Expert,
+    Master
 };
 
 enum class PlayerSide {
@@ -36,13 +36,13 @@ struct UiPreferences {
     bool showAnalysis = true;
     bool showThinkingIndicator = true;
     QString pieceStyle = "Classic";
-    EngineDifficulty defaultEngineDifficulty = EngineDifficulty::Medium;
+    EngineDifficulty defaultEngineDifficulty = EngineDifficulty::Advanced;
 };
 
 struct GameSettings {
     GameMode gameMode = GameMode::HumanVsEngine;
     PlayerSide playerSide = PlayerSide::White;
-    EngineDifficulty engineDifficulty = EngineDifficulty::Medium;
+    EngineDifficulty engineDifficulty = EngineDifficulty::Advanced;
     qint64 initialTimeMs = 5 * 60 * 1000;
 };
 
@@ -57,6 +57,10 @@ struct AppSettings {
 QString gameModeText(GameMode mode);
 QString playerSideText(PlayerSide side);
 QString difficultyText(EngineDifficulty difficulty);
+QString difficultyDescription(EngineDifficulty difficulty);
+QString difficultySpecText(EngineDifficulty difficulty);
 QString boardThemeText(ChessBoardWidget::BoardTheme theme);
 int difficultyDepth(EngineDifficulty difficulty);
 int difficultyMoveTimeMs(EngineDifficulty difficulty);
+int difficultyThreadCount(EngineDifficulty difficulty);
+int difficultyHashSizeMb(EngineDifficulty difficulty);

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 namespace {
 
@@ -185,6 +186,7 @@ bool isValidCounter(Profiler::CounterId counter)
 #ifdef ENABLE_ENGINE_PROFILING
 
 Profiler::Counter g_counters[Profiler::CounterCount]{};
+std::mutex g_counterMutex;
 thread_local Profiler::MovegenContext g_movegenContext = Profiler::MovegenContext::Other;
 thread_local Profiler::SeeContext g_seeContext = Profiler::SeeContext::Other;
 
@@ -517,6 +519,7 @@ bool isCompiledIn()
 void reset()
 {
 #ifdef ENABLE_ENGINE_PROFILING
+    std::lock_guard<std::mutex> lock(g_counterMutex);
     std::memset(g_counters, 0, sizeof(g_counters));
 #endif
 }
@@ -526,6 +529,7 @@ std::string report()
 #ifndef ENABLE_ENGINE_PROFILING
     return "profiling not compiled in";
 #else
+    std::lock_guard<std::mutex> lock(g_counterMutex);
     std::string out;
     out.reserve(4096);
     out += "engine profiling report\n";
@@ -556,6 +560,7 @@ uint64_t value(CounterId counter)
     if (!isValidCounter(counter)) {
         return 0;
     }
+    std::lock_guard<std::mutex> lock(g_counterMutex);
     return g_counters[static_cast<int>(counter)].value;
 #endif
 }
@@ -567,6 +572,7 @@ void increment(CounterId counter)
     if (!isValidCounter(counter)) {
         return;
     }
+    std::lock_guard<std::mutex> lock(g_counterMutex);
     ++g_counters[static_cast<int>(counter)].value;
 }
 
@@ -575,6 +581,7 @@ void add(CounterId counter, uint64_t amount)
     if (!isValidCounter(counter)) {
         return;
     }
+    std::lock_guard<std::mutex> lock(g_counterMutex);
     g_counters[static_cast<int>(counter)].value += amount;
 }
 
@@ -584,6 +591,7 @@ void recordMax(CounterId counter, uint64_t sample)
         return;
     }
 
+    std::lock_guard<std::mutex> lock(g_counterMutex);
     Counter& current = g_counters[static_cast<int>(counter)];
     ++current.calls;
     if (sample > current.maxValue) {
@@ -597,6 +605,7 @@ void recordTimer(CounterId counter, uint64_t nanoseconds)
         return;
     }
 
+    std::lock_guard<std::mutex> lock(g_counterMutex);
     Counter& current = g_counters[static_cast<int>(counter)];
     current.value += nanoseconds;
     ++current.calls;

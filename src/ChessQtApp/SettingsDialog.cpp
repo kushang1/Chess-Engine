@@ -4,6 +4,7 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QTabWidget>
 #include <QVBoxLayout>
@@ -43,6 +44,10 @@ SettingsDialog::SettingsDialog(const UiPreferences& preferences, QWidget* parent
     title->setObjectName("DialogTitle");
     root->addWidget(title);
 
+    auto* subtitle = new QLabel("Shape the board, feedback, and engine experience.", this);
+    subtitle->setObjectName("MutedLabel");
+    root->addWidget(subtitle);
+
     auto* tabs = new QTabWidget(this);
     tabs->setObjectName("SettingsTabs");
 
@@ -71,7 +76,7 @@ SettingsDialog::SettingsDialog(const UiPreferences& preferences, QWidget* parent
     m_animationsCheck = new QCheckBox("Smooth move animations", appearance);
     m_animationsCheck->setChecked(preferences.animationsEnabled);
     formOf(appearance)->addRow(QString(), m_animationsCheck);
-    tabs->addTab(appearance, "Appearance");
+    tabs->addTab(appearance, QIcon(":/icons/theme.svg"), "Appearance");
 
     QWidget* gameplay = makeTab(tabs);
     m_legalMoveHintsCheck = new QCheckBox("Show legal move hints", gameplay);
@@ -89,12 +94,16 @@ SettingsDialog::SettingsDialog(const UiPreferences& preferences, QWidget* parent
     m_soundsCheck = new QCheckBox("Sound effects", gameplay);
     m_soundsCheck->setChecked(preferences.soundsEnabled);
     formOf(gameplay)->addRow(QString(), m_soundsCheck);
-    tabs->addTab(gameplay, "Gameplay");
+    tabs->addTab(gameplay, QIcon(":/icons/sound.svg"), "Gameplay");
 
     QWidget* engine = makeTab(tabs);
     m_defaultDifficultyCombo = new QComboBox(engine);
-    for (int i = 0; i <= static_cast<int>(EngineDifficulty::Expert); ++i) {
-        m_defaultDifficultyCombo->addItem(difficultyText(static_cast<EngineDifficulty>(i)));
+    for (int i = 0; i <= static_cast<int>(EngineDifficulty::Master); ++i) {
+        const auto difficulty = static_cast<EngineDifficulty>(i);
+        m_defaultDifficultyCombo->addItem(difficultyText(difficulty));
+        m_defaultDifficultyCombo->setItemData(i,
+                                              difficultyDescription(difficulty) + "\n" + difficultySpecText(difficulty),
+                                              Qt::ToolTipRole);
     }
     m_defaultDifficultyCombo->setCurrentIndex(static_cast<int>(preferences.defaultEngineDifficulty));
     formOf(engine)->addRow("Default difficulty", m_defaultDifficultyCombo);
@@ -106,7 +115,7 @@ SettingsDialog::SettingsDialog(const UiPreferences& preferences, QWidget* parent
     m_showThinkingCheck = new QCheckBox("Show engine thinking indicator", engine);
     m_showThinkingCheck->setChecked(preferences.showThinkingIndicator);
     formOf(engine)->addRow(QString(), m_showThinkingCheck);
-    tabs->addTab(engine, "Engine");
+    tabs->addTab(engine, QIcon(":/icons/difficulty.svg"), "Engine");
 
     root->addWidget(tabs, 1);
 

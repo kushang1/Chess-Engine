@@ -1,8 +1,14 @@
 #include "EngineFacade.h"
 
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include "Board.h"
 #include "Engine.h"
@@ -138,16 +144,244 @@ long long perftImpl(board& position, MoveGenerator& moveGenerator, int depth)
 
 namespace chess {
 
+namespace {
+
+constexpr int MinSearchThreads = 1;
+constexpr int MaxSearchThreads = 256;
+
+bool isUsableMove(const Move& move)
+{
+    return move.from >= 0 && move.to >= 0;
+}
+
+} // namespace
+
+class SearchThreadPool {
+public:
+    ~SearchThreadPool()
+    {
+        shutdown();
+    }
+
+    void resize(int count)
+    {
+        count = std::clamp(count, MinSearchThreads, MaxSearchThreads);
+        if (count == static_cast<int>(threads.size())) {
+            return;
+        }
+
+        if (!threads.empty()) {
+            shutdown();
+        }
+
+        threads.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            threads.emplace_back([this]() { threadLoop(); });
+        }
+    }
+
+    void run(int count, const std::function<void(int)>& task)
+    {
+        count = std::clamp(count, 0, static_cast<int>(threads.size()));
+        if (count <= 0) {
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(mutex);
+        currentTask = task;
+        pending.clear();
+        pending.reserve(count);
+        for (int id = 0; id < count; ++id) {
+            pending.push_back(id);
+        }
+        active = count;
+
+        workAvailable.notify_all();
+        workDone.wait(lock, [this]() { return active == 0; });
+        currentTask = nullptr;
+    }
+
+private:
+    void shutdown()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            shuttingDown = true;
+            pending.clear();
+        }
+
+        workAvailable.notify_all();
+        for (std::thread& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        threads.clear();
+
+        std::lock_guard<std::mutex> lock(mutex);
+        active = 0;
+        currentTask = nullptr;
+        shuttingDown = false;
+    }
+
+    void threadLoop()
+    {
+        for (;;) {
+            int workerId = -1;
+            std::function<void(int)> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                workAvailable.wait(lock, [this]() {
+                    return shuttingDown || !pending.empty();
+                });
+
+                if (shuttingDown) {
+                    return;
+                }
+
+                workerId = pending.back();
+                pending.pop_back();
+                task = currentTask;
+            }
+
+            if (task) {
+                task(workerId);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                --active;
+                if (active == 0) {
+                    workDone.notify_one();
+                }
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable workAvailable;
+    std::condition_variable workDone;
+    std::vector<std::thread> threads;
+    std::vector<int> pending;
+    std::function<void(int)> currentTask;
+    int active = 0;
+    bool shuttingDown = false;
+};
+
+struct SearchWorker {
+    explicit SearchWorker(int id,
+        const std::shared_ptr<SharedTranspositionTable>& table,
+        const std::shared_ptr<SharedSearchControl>& control)
+        : workerId(id)
+    {
+        engine.moveGenerator = &moveGenerator;
+        engine.setWorkerId(workerId);
+        engine.setSharedTranspositionTable(table);
+        engine.setSharedSearchControl(control);
+        engine.setEmitUciInfo(workerId == 0);
+    }
+
+    int workerId = 0;
+    MoveGenerator moveGenerator;
+    Engine engine;
+};
+
 class ChessEngine::Impl {
 public:
     Impl()
     {
         searcher.moveGenerator = &moveGenerator;
+        searcher.setSharedTranspositionTable(table);
+        searcher.setSharedSearchControl(control);
+        ensureThreadCount(1);
+    }
+
+    struct WorkerOutput {
+        Move bestMove;
+        int score = 0;
+        int depth = 0;
+        long long nodes = 0;
+        long long leafNodes = 0;
+        bool valid = false;
+    };
+
+    void ensureThreadCount(int requested)
+    {
+        requested = std::clamp(requested, MinSearchThreads, MaxSearchThreads);
+        while (static_cast<int>(workers.size()) < requested) {
+            int id = static_cast<int>(workers.size());
+            workers.push_back(std::make_unique<SearchWorker>(id, table, control));
+        }
+        threadPool.resize(requested);
+        configuredThreads = requested;
+    }
+
+    void configureHash(int megabytes)
+    {
+        hashSizeMb = megabytes;
+        table->resize(hashSizeMb);
+    }
+
+    WorkerOutput runWorker(int workerId, const SearchLimits& limits,
+        const std::vector<uint64_t>& repetitions)
+    {
+        SearchWorker& worker = *workers[workerId];
+        worker.engine.setWorkerId(workerId);
+        worker.engine.setEmitUciInfo(workerId == 0);
+        worker.engine.setSharedTranspositionTable(table);
+        worker.engine.setSharedSearchControl(control);
+        worker.engine.setTimeLimitMs(limits.moveTimeMs);
+        worker.engine.setNodeLimit(limits.nodeLimit);
+        worker.engine.clearStop();
+
+        board workerPosition = position;
+        WorkerOutput output;
+        output.bestMove = worker.engine.findBestMove(
+            workerPosition, limits.maxDepth, repetitions, limits.searchMoves);
+        output.score = worker.engine.lastSearchScore();
+        output.depth = worker.engine.lastSearchDepth();
+        output.nodes = worker.engine.nodesSearched();
+        output.leafNodes = worker.engine.leafNodesSearched();
+        output.valid = isUsableMove(output.bestMove);
+        return output;
+    }
+
+    int chooseBestWorker(const std::vector<WorkerOutput>& outputs) const
+    {
+        int best = 0;
+        for (int i = 1; i < static_cast<int>(outputs.size()); ++i) {
+            const WorkerOutput& candidate = outputs[i];
+            const WorkerOutput& current = outputs[best];
+            if (!candidate.valid) {
+                continue;
+            }
+            if (!current.valid) {
+                best = i;
+                continue;
+            }
+            if (candidate.depth > current.depth) {
+                best = i;
+                continue;
+            }
+            if (candidate.depth == current.depth &&
+                candidate.score > current.score) {
+                best = i;
+            }
+        }
+        return best;
     }
 
     board position;
     MoveGenerator moveGenerator;
     Engine searcher;
+    std::shared_ptr<SharedTranspositionTable> table =
+        std::make_shared<SharedTranspositionTable>();
+    std::shared_ptr<SharedSearchControl> control =
+        std::make_shared<SharedSearchControl>();
+    std::vector<std::unique_ptr<SearchWorker>> workers;
+    SearchThreadPool threadPool;
+    int configuredThreads = 1;
+    int hashSizeMb = 128;
 };
 
 ChessEngine::ChessEngine()
@@ -271,22 +505,42 @@ SearchResult ChessEngine::findBestMove(const SearchLimits& limits)
 SearchResult ChessEngine::findBestMove(const SearchLimits& limits, const std::vector<uint64_t>& repetitionHistory)
 {
     SearchResult result;
-    impl->searcher.setTimeLimitMs(limits.moveTimeMs);
-    impl->searcher.setNodeLimit(limits.nodeLimit);
-    impl->searcher.resetSearchStats();
+    const int activeThreads = std::clamp(
+        impl->configuredThreads, MinSearchThreads, MaxSearchThreads);
+    impl->ensureThreadCount(activeThreads);
 
     std::vector<uint64_t> repetitions = repetitionHistory;
     if (repetitions.empty()) {
         repetitions.push_back(impl->position.hash);
     }
 
+    impl->control->start(limits.moveTimeMs, limits.nodeLimit);
     auto start = std::chrono::steady_clock::now();
-    result.bestMove = impl->searcher.findBestMove(
-        impl->position, limits.maxDepth, repetitions, limits.searchMoves);
+
+    std::vector<Impl::WorkerOutput> outputs(activeThreads);
+    if (activeThreads == 1) {
+        outputs[0] = impl->runWorker(0, limits, repetitions);
+    }
+    else {
+        impl->threadPool.run(activeThreads, [&](int workerId) {
+            outputs[workerId] = impl->runWorker(workerId, limits, repetitions);
+        });
+    }
+
     auto end = std::chrono::steady_clock::now();
 
-    result.nodes = impl->searcher.nodesSearched();
-    result.leafNodes = impl->searcher.leafNodesSearched();
+    const int bestWorker = impl->chooseBestWorker(outputs);
+    result.bestMove = outputs[bestWorker].bestMove;
+    result.bestScore = outputs[bestWorker].score;
+    result.completedDepth = outputs[bestWorker].depth;
+    result.nodes = impl->control->nodesSearched();
+    result.leafNodes = 0;
+    result.threads = activeThreads;
+    result.workerNodes.reserve(outputs.size());
+    for (const Impl::WorkerOutput& output : outputs) {
+        result.leafNodes += output.leafNodes;
+        result.workerNodes.push_back(output.nodes);
+    }
     result.elapsedMs = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
     return result;
@@ -294,17 +548,39 @@ SearchResult ChessEngine::findBestMove(const SearchLimits& limits, const std::ve
 
 void ChessEngine::setHashSizeMb(int megabytes)
 {
-    impl->searcher.setHashSizeMb(megabytes);
+    impl->configureHash(megabytes);
+    impl->searcher.setSharedTranspositionTable(impl->table);
+    for (const std::unique_ptr<SearchWorker>& worker : impl->workers) {
+        worker->engine.setSharedTranspositionTable(impl->table);
+    }
+}
+
+void ChessEngine::setThreadCount(int threads)
+{
+    impl->ensureThreadCount(threads);
+}
+
+int ChessEngine::threadCount() const
+{
+    return impl->configuredThreads;
 }
 
 void ChessEngine::clearSearchStop()
 {
+    impl->control->clearStop();
     impl->searcher.clearStop();
+    for (const std::unique_ptr<SearchWorker>& worker : impl->workers) {
+        worker->engine.clearStop();
+    }
 }
 
 void ChessEngine::stopSearch()
 {
+    impl->control->requestStop();
     impl->searcher.requestStop();
+    for (const std::unique_ptr<SearchWorker>& worker : impl->workers) {
+        worker->engine.requestStop();
+    }
 }
 
 int ChessEngine::evaluate() const

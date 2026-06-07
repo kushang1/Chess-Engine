@@ -5,6 +5,7 @@
 #include <QDialogButtonBox>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QPushButton>
 #include <QRadioButton>
@@ -53,17 +54,22 @@ NewGameDialog::NewGameDialog(const GameSettings& settings, QWidget* parent)
     setObjectName("NewGameDialog");
     setWindowTitle("New Game");
     setModal(true);
-    resize(500, 460);
+    resize(780, 650);
+    setMinimumWidth(720);
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(22, 22, 22, 22);
     root->setSpacing(16);
 
-    auto* title = new QLabel("New Game", this);
+    auto* eyebrow = new QLabel("MATCH SETUP", this);
+    eyebrow->setObjectName("EyebrowLabel");
+    root->addWidget(eyebrow);
+
+    auto* title = new QLabel("Choose your next battle", this);
     title->setObjectName("DialogTitle");
     root->addWidget(title);
 
-    auto* subtitle = new QLabel("Choose the match type and engine setup.", this);
+    auto* subtitle = new QLabel("Pick a mode, tune the challenge, and enter the board.", this);
     subtitle->setObjectName("MutedLabel");
     root->addWidget(subtitle);
 
@@ -72,8 +78,14 @@ NewGameDialog::NewGameDialog(const GameSettings& settings, QWidget* parent)
 
     auto* modeLayout = new QHBoxLayout();
     modeLayout->setSpacing(12);
-    modeLayout->addWidget(createModeCard("Human vs Human", "Two local players share the board.", static_cast<int>(GameMode::HumanVsHuman)));
-    modeLayout->addWidget(createModeCard("Human vs Engine", "Play one side against the engine.", static_cast<int>(GameMode::HumanVsEngine)));
+    modeLayout->addWidget(createModeCard("Local Match",
+                                         "Two players, one board",
+                                         ":/icons/human-vs-human.svg",
+                                         static_cast<int>(GameMode::HumanVsHuman)));
+    modeLayout->addWidget(createModeCard("Challenge Engine",
+                                         "Five strengths, maximum power",
+                                         ":/icons/human-vs-engine.svg",
+                                         static_cast<int>(GameMode::HumanVsEngine)));
     root->addLayout(modeLayout);
 
     m_enginePanel = new QWidget(this);
@@ -102,15 +114,23 @@ NewGameDialog::NewGameDialog(const GameSettings& settings, QWidget* parent)
     sideLayout->addStretch();
     engineLayout->addLayout(sideLayout);
 
-    auto* difficultyLabel = new QLabel("Engine difficulty", m_enginePanel);
+    auto* difficultyLabel = new QLabel("Engine strength", m_enginePanel);
     difficultyLabel->setObjectName("SectionLabel");
     engineLayout->addWidget(difficultyLabel);
 
-    m_difficultyCombo = new QComboBox(m_enginePanel);
-    for (int i = 0; i <= static_cast<int>(EngineDifficulty::Expert); ++i) {
-        m_difficultyCombo->addItem(difficultyText(static_cast<EngineDifficulty>(i)));
+    m_difficultyGroup = new QButtonGroup(this);
+    m_difficultyGroup->setExclusive(true);
+    auto* difficultyLayout = new QHBoxLayout();
+    difficultyLayout->setSpacing(8);
+    for (int i = 0; i <= static_cast<int>(EngineDifficulty::Master); ++i) {
+        difficultyLayout->addWidget(createDifficultyCard(static_cast<EngineDifficulty>(i)), 1);
     }
-    engineLayout->addWidget(m_difficultyCombo);
+    engineLayout->addLayout(difficultyLayout);
+
+    m_difficultyDetails = new QLabel(m_enginePanel);
+    m_difficultyDetails->setObjectName("DifficultyDetails");
+    m_difficultyDetails->setWordWrap(true);
+    engineLayout->addWidget(m_difficultyDetails);
     root->addWidget(m_enginePanel);
 
     auto* timePanel = new QWidget(this);
@@ -122,7 +142,7 @@ NewGameDialog::NewGameDialog(const GameSettings& settings, QWidget* parent)
     timeLabel->setObjectName("SectionLabel");
     timeLayout->addWidget(timeLabel);
     m_timeControlCombo = new QComboBox(timePanel);
-    m_timeControlCombo->addItems({ "Unlimited", "5+0", "10+0", "15+0" });
+    m_timeControlCombo->addItems({ "Unlimited", "5 minutes", "10 minutes", "15 minutes" });
     timeLayout->addWidget(m_timeControlCombo);
     root->addWidget(timePanel);
 
@@ -144,12 +164,15 @@ NewGameDialog::NewGameDialog(const GameSettings& settings, QWidget* parent)
     if (auto* sideButton = m_sideGroup->button(static_cast<int>(settings.playerSide))) {
         sideButton->setChecked(true);
     }
-    m_difficultyCombo->setCurrentIndex(static_cast<int>(settings.engineDifficulty));
+    if (auto* difficultyButton = m_difficultyGroup->button(static_cast<int>(settings.engineDifficulty))) {
+        difficultyButton->setChecked(true);
+    }
     m_timeControlCombo->setCurrentIndex(timeControlIndex(settings.initialTimeMs));
 
     connect(m_modeGroup, &QButtonGroup::idClicked, this, &NewGameDialog::updateEngineControls);
     connect(m_sideGroup, &QButtonGroup::idClicked, this, &NewGameDialog::updateEngineControls);
-    connect(m_difficultyCombo, &QComboBox::currentIndexChanged, this, &NewGameDialog::updateEngineControls);
+    connect(m_difficultyGroup, &QButtonGroup::idClicked, this, &NewGameDialog::updateEngineControls);
+    connect(m_timeControlCombo, &QComboBox::currentIndexChanged, this, &NewGameDialog::updateEngineControls);
     updateEngineControls();
 }
 
@@ -158,30 +181,45 @@ GameSettings NewGameDialog::gameSettings() const
     GameSettings settings = m_initialSettings;
     settings.gameMode = static_cast<GameMode>(m_modeGroup->checkedId());
     settings.playerSide = static_cast<PlayerSide>(m_sideGroup->checkedId());
-    settings.engineDifficulty = static_cast<EngineDifficulty>(m_difficultyCombo->currentIndex());
+    settings.engineDifficulty = static_cast<EngineDifficulty>(m_difficultyGroup->checkedId());
     settings.initialTimeMs = timeControlMsFromIndex(m_timeControlCombo->currentIndex());
     return settings;
 }
 
-QWidget* NewGameDialog::createModeCard(const QString& title, const QString& subtitle, int id)
+QPushButton* NewGameDialog::createModeCard(const QString& title,
+                                           const QString& subtitle,
+                                           const QString& iconPath,
+                                           int id)
 {
-    auto* card = new QWidget(this);
-    card->setObjectName("ChoiceCard");
-    auto* layout = new QVBoxLayout(card);
-    layout->setContentsMargins(14, 12, 14, 12);
-    layout->setSpacing(6);
+    auto* card = new QPushButton(QIcon(iconPath), title + "\n" + subtitle, this);
+    card->setObjectName("ModeCard");
+    card->setCheckable(true);
+    card->setCursor(Qt::PointingHandCursor);
+    card->setIconSize(QSize(36, 36));
+    card->setMinimumHeight(82);
+    m_modeGroup->addButton(card, id);
+    return card;
+}
 
-    auto* radio = makeRadio(title, card);
-    radio->setObjectName("ChoiceTitle");
-    m_modeGroup->addButton(radio, id);
-    layout->addWidget(radio);
+QPushButton* NewGameDialog::createDifficultyCard(EngineDifficulty difficulty)
+{
+    static const QStringList subtitles = {
+        "Friendly",
+        "Tactical",
+        "Club",
+        "Relentless",
+        "Maximum"
+    };
 
-    auto* text = new QLabel(subtitle, card);
-    text->setObjectName("MutedLabel");
-    text->setWordWrap(true);
-    layout->addWidget(text);
-    layout->addStretch();
-
+    const int id = static_cast<int>(difficulty);
+    auto* card = new QPushButton(difficultyText(difficulty) + "\n" + subtitles.value(id), m_enginePanel);
+    card->setObjectName("DifficultyCard");
+    card->setProperty("tier", id);
+    card->setCheckable(true);
+    card->setCursor(Qt::PointingHandCursor);
+    card->setMinimumHeight(68);
+    card->setToolTip(difficultyDescription(difficulty) + "\n" + difficultySpecText(difficulty));
+    m_difficultyGroup->addButton(card, id);
     return card;
 }
 
@@ -192,13 +230,18 @@ void NewGameDialog::updateEngineControls()
 
     if (engineGame) {
         const auto side = static_cast<PlayerSide>(m_sideGroup->checkedId());
-        const auto difficulty = static_cast<EngineDifficulty>(m_difficultyCombo->currentIndex());
-        m_summaryLabel->setText(QString("%1 - %2 - You are %3")
+        const auto difficulty = static_cast<EngineDifficulty>(m_difficultyGroup->checkedId());
+        m_difficultyDetails->setText(QString("<b>%1</b><br>%2")
+                                     .arg(difficultyDescription(difficulty),
+                                          difficultySpecText(difficulty)));
+        m_summaryLabel->setText(QString("%1  |  %2  |  You play %3  |  %4")
                                 .arg(gameModeText(GameMode::HumanVsEngine),
                                      difficultyText(difficulty),
-                                     playerSideText(side)));
+                                     playerSideText(side),
+                                     m_timeControlCombo->currentText()));
     }
     else {
+        m_difficultyDetails->setText("Engine controls are available in Challenge Engine mode.");
         m_summaryLabel->setText("Human vs Human - both sides are controlled locally.");
     }
 }

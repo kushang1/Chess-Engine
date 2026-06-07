@@ -1,6 +1,7 @@
 #include "ChessBoardWidget.h"
 
 #include <QApplication>
+#include <QImage>
 #include <QMouseEvent>
 #include <QParallelAnimationGroup>
 #include <QPainter>
@@ -43,6 +44,58 @@ QColor withAlpha(QColor color, int alpha)
 {
     color.setAlpha(alpha);
     return color;
+}
+
+QPixmap makeHighResolutionPiece(const QString& resource)
+{
+    constexpr int kUpscale = 8;
+    QImage source(resource);
+    if (source.isNull()) {
+        return {};
+    }
+
+    QImage image = source.convertToFormat(QImage::Format_ARGB32)
+                       .scaled(source.width() * kUpscale,
+                               source.height() * kUpscale,
+                               Qt::IgnoreAspectRatio,
+                               Qt::SmoothTransformation);
+
+    const int width = image.width();
+    const int height = image.height();
+    std::vector<int> alpha(static_cast<std::size_t>(width * height));
+    for (int y = 0; y < height; ++y) {
+        const QRgb* line = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+        for (int x = 0; x < width; ++x) {
+            alpha[static_cast<std::size_t>(y * width + x)] = qAlpha(line[x]);
+        }
+    }
+
+    auto alphaAt = [&](int x, int y) {
+        x = std::clamp(x, 0, width - 1);
+        y = std::clamp(y, 0, height - 1);
+        return alpha[static_cast<std::size_t>(y * width + x)];
+    };
+
+    for (int y = 0; y < height; ++y) {
+        QRgb* line = reinterpret_cast<QRgb*>(image.scanLine(y));
+        for (int x = 0; x < width; ++x) {
+            const int center = alphaAt(x, y);
+            const int blurred =
+                (alphaAt(x - 1, y - 1) + 2 * alphaAt(x, y - 1) + alphaAt(x + 1, y - 1) +
+                 2 * alphaAt(x - 1, y) + 4 * center + 2 * alphaAt(x + 1, y) +
+                 alphaAt(x - 1, y + 1) + 2 * alphaAt(x, y + 1) + alphaAt(x + 1, y + 1)) / 16;
+            int sharpened = std::clamp(center + (center - blurred) * 2, 0, 255);
+            if (sharpened < 3) {
+                sharpened = 0;
+            }
+            else if (sharpened > 252) {
+                sharpened = 255;
+            }
+            line[x] = qRgba(qRed(line[x]), qGreen(line[x]), qBlue(line[x]), sharpened);
+        }
+    }
+
+    return QPixmap::fromImage(image);
 }
 
 } // namespace
@@ -456,7 +509,7 @@ qreal ChessBoardWidget::squareSize() const
 void ChessBoardWidget::loadPiecePixmaps()
 {
     for (int i = 0; i < static_cast<int>(m_piecePixmaps.size()); ++i) {
-        m_piecePixmaps[i] = QPixmap(pieceResource(static_cast<Piece>(i)));
+        m_piecePixmaps[i] = makeHighResolutionPiece(pieceResource(static_cast<Piece>(i)));
     }
 }
 
@@ -465,12 +518,16 @@ void ChessBoardWidget::drawBoard(QPainter& painter)
     const QRectF board = boardRect();
     const ThemeColors theme = colors();
 
+    QPainterPath ambientGlow;
+    ambientGlow.addRoundedRect(board.adjusted(-5, -5, 5, 5), 21, 21);
+    painter.fillPath(ambientGlow, QColor(86, 228, 196, 15));
+
     QPainterPath shadow;
-    shadow.addRoundedRect(board.adjusted(5, 8, 5, 10), 18, 18);
-    painter.fillPath(shadow, QColor(0, 0, 0, 64));
+    shadow.addRoundedRect(board.adjusted(7, 10, 7, 12), 20, 20);
+    painter.fillPath(shadow, QColor(0, 0, 0, 78));
 
     QPainterPath clipPath;
-    clipPath.addRoundedRect(board, 16, 16);
+    clipPath.addRoundedRect(board, 18, 18);
     painter.save();
     painter.setClipPath(clipPath);
 
@@ -490,7 +547,7 @@ void ChessBoardWidget::drawBoard(QPainter& painter)
     QPen border(theme.border, 2.0);
     painter.setPen(border);
     painter.setBrush(Qt::NoBrush);
-    painter.drawRoundedRect(board.adjusted(1, 1, -1, -1), 16, 16);
+    painter.drawRoundedRect(board.adjusted(1, 1, -1, -1), 18, 18);
 }
 
 void ChessBoardWidget::drawHighlights(QPainter& painter)
@@ -507,6 +564,10 @@ void ChessBoardWidget::drawHighlights(QPainter& painter)
         painter.setBrush(color);
         painter.drawRoundedRect(rect, std::max<qreal>(6.0, cell * 0.08), std::max<qreal>(6.0, cell * 0.08));
     };
+
+    if (m_hoverSquare >= 0 && !m_interactionLocked && m_hoverSquare != m_selectedSquare) {
+        fillRounded(m_hoverSquare, QColor(255, 255, 255, 28));
+    }
 
     if (m_lastFrom >= 0) {
         fillRounded(m_lastFrom, QColor(255, 222, 89, static_cast<int>(255 * glowOpacity)));
